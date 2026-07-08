@@ -45,6 +45,7 @@ services:
     networks:
       - openwa-network
       - internal-docker
+      - dokploy-network
     # Container hardening: Chromium runs with --no-sandbox, so the
     # container itself is the confinement boundary. cap_drop ALL + a minimal re-add
     # ONLY for the root entrypoint's chown + gosu privilege-drop; once gosu setuids to
@@ -65,6 +66,9 @@ services:
     read_only: true
     tmpfs:
       - /tmp
+
+    shm_size: "1gb"
+    
     # Per-container PID ceiling (writes the cgroup pids.max). A fork-bomb guard, NOT an allocation —
     # the kernel only rejects new forks once the count is reached, so a higher limit is free for
     # light containers. The old default (512, from the #243 hardening pass) was picked without
@@ -312,3 +316,6 @@ networks:
   internal-docker:
     name: openwa-internal-docker
     internal: true
+
+  dokploy-network:
+    external: true
