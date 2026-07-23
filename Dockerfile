@@ -45,9 +45,14 @@ RUN npm run build && npm run dashboard:ci -- --include=dev && npm run dashboard:
 # ===== Stage 2: Production =====
 FROM docker.io/node:22-slim AS production
 
-# Install Chrome/Chromium and required dependencies
+# Chrome for Testing has no linux-arm64 build, and Puppeteer's chromium snapshot
+# is x86_64-only on Linux too. So: amd64 uses Chrome for Testing (downloaded below)
+# to avoid the Debian chromium package's K8s SIGTRAP under strict non-root/seccomp;
+# arm64 installs Debian's chromium instead (it ships a native arm64 build). Both
+# resolve to the same /usr/local/bin/puppeteer-chrome symlink below.
+ARG TARGETARCH
 RUN apt-get update && apt-get install -y \
-    chromium \
+    $([ "$TARGETARCH" = arm64 ] && echo chromium) \
     fonts-liberation \
     libappindicator3-1 \
     libasound2 \
@@ -67,12 +72,12 @@ RUN apt-get update && apt-get install -y \
     xdg-utils \
     dumb-init \
     gosu \
+    patch \
     curl \
     procps \
     && rm -rf /var/lib/apt/lists/*
 
-# Set Chrome executable path for Puppeteer
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+# Set Puppeteer to skip automatic download during npm install (we download it explicitly below)
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 
 # Create app user for security
@@ -83,8 +88,28 @@ WORKDIR /app
 # Copy package files
 COPY package*.json ./
 
-# Install production dependencies only
-RUN npm ci --omit=dev && npm cache clean --force
+# Backport upstream whatsapp-web.js#201832 (id._serialized -> id.$1 normalization,
+# broken by WA Web 2.3000.x ~2026-07-14) into the installed dep at build time.
+# The patcher self-disables once whatsapp-web.js ships the fix upstream.
+COPY scripts/patch-wwebjs-201832.js scripts/wwebjs-201832.patch ./scripts/
+
+# Install production dependencies only, then apply the backport patcher (needs `patch`).
+RUN npm ci --omit=dev && node scripts/patch-wwebjs-201832.js && npm cache clean --force
+
+# amd64: download Chrome for Testing via Puppeteer and symlink it.
+# arm64: use Debian's chromium installed above (CfT has no linux-arm64 build).
+# test -n guards against a future path mismatch failing loudly instead of shipping a broken image.
+RUN if [ "$TARGETARCH" = arm64 ]; then \
+        ln -s /usr/bin/chromium /usr/local/bin/puppeteer-chrome; \
+    else \
+        mkdir -p /opt/puppeteer && \
+        PUPPETEER_CACHE_DIR=/opt/puppeteer ./node_modules/.bin/puppeteer browsers install 'chrome@146.0.7680.31' && \
+        chown -R openwa:openwa /opt/puppeteer && \
+        chrome_path=$(find /opt/puppeteer/chrome/linux*/chrome-linux64/chrome | head -n 1) && \
+        test -n "$chrome_path" && \
+        ln -s "$chrome_path" /usr/local/bin/puppeteer-chrome; \
+    fi
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/local/bin/puppeteer-chrome
 
 # Copy built application from builder stage
 COPY --from=builder /app/dist ./dist

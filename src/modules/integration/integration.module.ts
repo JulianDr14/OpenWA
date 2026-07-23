@@ -11,9 +11,12 @@ import { IngressController } from './ingress.controller';
 import { IngressEnqueueService, buildIngressDeadLetterRow } from './ingress-enqueue.service';
 import { RedriveService } from './redrive.service';
 import { RedriveController } from './redrive.controller';
+import { IntegrationRetentionService } from './integration-retention.service';
 import { IntegrationInstanceController } from './integration-instance.controller';
 import { ScopeBindingService } from './scope-binding.service';
 import { PluginLoaderService } from '../../core/plugins/plugin-loader.service';
+import { SessionModule } from '../session/session.module';
+import { SessionService } from '../session/session.service';
 import { createLogger } from '../../common/services/logger.service';
 
 /**
@@ -24,7 +27,10 @@ import { createLogger } from '../../common/services/logger.service';
  * PluginLoaderService is @Global (PluginsModule), so it injects without importing that module.
  */
 @Module({
-  imports: [TypeOrmModule.forFeature([PluginInstance, IngressEvent, IntegrationDeliveryFailure], 'data')],
+  imports: [
+    SessionModule,
+    TypeOrmModule.forFeature([PluginInstance, IngressEvent, IntegrationDeliveryFailure], 'data'),
+  ],
   controllers: [IngressController, RedriveController, IntegrationInstanceController],
   providers: [
     PluginInstanceService,
@@ -32,6 +38,7 @@ import { createLogger } from '../../common/services/logger.service';
     IngressEnqueueService,
     RedriveService,
     ScopeBindingService,
+    IntegrationRetentionService,
     {
       provide: IngressService,
       inject: [
@@ -40,6 +47,7 @@ import { createLogger } from '../../common/services/logger.service';
         PluginLoaderService,
         IngressEnqueueService,
         getRepositoryToken(IntegrationDeliveryFailure, 'data'),
+        SessionService,
       ],
       useFactory: (
         instances: PluginInstanceService,
@@ -47,13 +55,22 @@ import { createLogger } from '../../common/services/logger.service';
         loader: PluginLoaderService,
         ingressEnqueue: IngressEnqueueService,
         failures: Repository<IntegrationDeliveryFailure>,
+        sessions: SessionService,
       ) => {
         const dlqLogger = createLogger('IngressEnqueue');
+        const ingressLogger = createLogger('Ingress');
         return new IngressService({
           instances: { resolve: (pluginId, instanceId) => instances.resolve(pluginId, instanceId) },
           manifestRoute: (pluginId, route): IngressRouteDescriptor | undefined =>
             loader.getPlugin(pluginId)?.manifest.ingress?.find(r => r.route === route),
           events: { recordOrSkip: input => events.recordOrSkip(input) },
+          // O(1) in-memory liveness probe for the `session-alive` preflight: a Map read + a field read.
+          // MUST stay cheap — never call engine.initialize() here (that is the slow/blocking path bounded
+          // separately by the #667/#696 init-timeout). Undefined = no live engine (stopped/deleted).
+          sessionStatus: (scope: string) => sessions.getEngine(scope)?.getStatus(),
+          // Audit sink for preflight rejections (they leave no dedup/DLQ row). The Prometheus counter is
+          // a separate follow-up (see plan notes); the structured log is the MVP audit surface.
+          log: (event, meta) => ingressLogger.warn(event, meta),
           // Live ingress delivery: on a swallowed inline-dispatch failure, persist a dead-letter row so
           // RedriveService can replay it — IngressService.handle() ignores the outcome and always 202s, so
           // nothing else would. RedriveService calls enqueue() directly (it is already replaying a DLQ
