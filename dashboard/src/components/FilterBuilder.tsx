@@ -2,11 +2,14 @@ import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Plus, X } from 'lucide-react';
 import {
+  MESSAGE_TYPES,
+  CHAT_KINDS,
   type Chat,
   type WebhookFilters,
   type WebhookFilterCondition,
   type WebhookFilterOperator,
 } from '../services/api';
+import { filterValueLabel } from '../utils/enumLabels';
 import './FilterBuilder.css';
 
 type FieldKind = 'id' | 'idArray' | 'text' | 'enum' | 'boolean';
@@ -15,32 +18,18 @@ interface FieldDescriptor {
   field: string;
   kind: FieldKind;
   operators: WebhookFilterOperator[];
-  enumValues?: string[];
+  enumValues?: readonly string[];
 }
-
-const MESSAGE_TYPES = [
-  'text',
-  'image',
-  'video',
-  'audio',
-  'voice',
-  'document',
-  'sticker',
-  'location',
-  'contact',
-  'call',
-  'revoked',
-  'masked',
-  'unknown',
-];
 
 // Mirrors the backend message-family field registry (src/modules/webhook/filters/filter-types.ts).
 const MESSAGE_FIELDS: FieldDescriptor[] = [
   { field: 'sender', kind: 'id', operators: ['is', 'isNot'] },
   { field: 'recipient', kind: 'id', operators: ['is', 'isNot'] },
+  { field: 'chatId', kind: 'id', operators: ['is', 'isNot'] },
   { field: 'body', kind: 'text', operators: ['contains', 'equals'] },
   { field: 'type', kind: 'enum', operators: ['is', 'isNot'], enumValues: MESSAGE_TYPES },
   { field: 'isGroup', kind: 'boolean', operators: ['is'] },
+  { field: 'kind', kind: 'enum', operators: ['is', 'isNot'], enumValues: CHAT_KINDS },
   { field: 'fromMe', kind: 'boolean', operators: ['is'] },
   { field: 'hasMedia', kind: 'boolean', operators: ['is'] },
   { field: 'mentions', kind: 'idArray', operators: ['is', 'isNot'] },
@@ -78,10 +67,14 @@ function ContactChipsInput({ value, onChange, chats }: ContactChipsInputProps) {
   const suggestions = useMemo(() => {
     const query = text.trim().toLowerCase();
     const chosen = new Set(value);
-    return chats
-      .filter(c => !chosen.has(c.id))
-      .filter(c => !query || c.name.toLowerCase().includes(query) || c.id.toLowerCase().includes(query))
-      .slice(0, 8);
+    return (
+      chats
+        .filter(c => !chosen.has(c.id))
+        .filter(c => !query || c.name.toLowerCase().includes(query) || c.id.toLowerCase().includes(query))
+        // The dropdown scrolls, so this only bounds how much of an account with up to 1000 chats is
+        // rendered on every keystroke. Typing narrows the list further.
+        .slice(0, 50)
+    );
   }, [text, chats, value]);
 
   const labelFor = (jid: string) => chats.find(c => c.id === jid)?.name ?? jid;
@@ -188,7 +181,12 @@ export function FilterBuilder({ filters, onChange, chats }: FilterBuilderProps) 
         const def = descriptorFor(condition.field);
         return (
           <div key={index} className="filter-row">
-            <select className="filter-field" value={condition.field} onChange={e => changeField(index, e.target.value)}>
+            <select
+              className="filter-field"
+              aria-label={t('webhooks.filters.fieldLabel')}
+              value={condition.field}
+              onChange={e => changeField(index, e.target.value)}
+            >
               {MESSAGE_FIELDS.map(f => (
                 <option key={f.field} value={f.field}>
                   {t(`webhooks.filters.fields.${f.field}`)}
@@ -198,6 +196,7 @@ export function FilterBuilder({ filters, onChange, chats }: FilterBuilderProps) 
 
             <select
               className="filter-operator"
+              aria-label={t('webhooks.filters.operatorLabel')}
               value={condition.operator}
               onChange={e => updateAt(index, { operator: e.target.value as WebhookFilterOperator })}
             >
@@ -233,7 +232,7 @@ export function FilterBuilder({ filters, onChange, chats }: FilterBuilderProps) 
                           });
                         }}
                       >
-                        {option}
+                        {filterValueLabel(t, def.field, option)}
                       </button>
                     );
                   })}
@@ -262,6 +261,7 @@ export function FilterBuilder({ filters, onChange, chats }: FilterBuilderProps) 
               {def.kind === 'boolean' && (
                 <select
                   className="filter-bool"
+                  aria-label={t('webhooks.filters.valueLabel')}
                   value={condition.value === true ? 'true' : 'false'}
                   onChange={e => updateAt(index, { value: e.target.value === 'true' })}
                 >

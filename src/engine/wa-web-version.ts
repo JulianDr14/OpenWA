@@ -1,8 +1,12 @@
 /**
- * WhatsApp Web build resolution for the whatsapp-web.js engine — kept dependency-free (process.env +
- * fetch only) so the infra status endpoint can import it without pulling in the heavy whatsapp-web.js
- * module and breaking engine lazy-loading.
+ * WhatsApp Web build resolution for the whatsapp-web.js engine — kept free of whatsapp-web.js
+ * imports (env + fetch + the app logger only) so the infra status endpoint can import it without
+ * pulling in the heavy whatsapp-web.js module and breaking engine lazy-loading.
  */
+
+import { createLogger } from '../common/services/logger.service';
+
+const logger = createLogger('WebVersion');
 
 export type WebVersionPin = { webVersion: string; webVersionCache: { type: 'remote'; remotePath: string } };
 
@@ -15,26 +19,92 @@ export const WA_VERSION_REGISTRY_URL =
 
 const DEFAULT_REMOTE_TEMPLATE = 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/{version}.html';
 
-// Module-level cache: undefined = not yet resolved, string = the resolved current build. A failed
-// fetch is NOT cached permanently — but to avoid re-stalling every call (e.g. each /infra/status poll
-// and every session start/reconnect) on a firewalled/offline host, a failure is rate-limited by
-// `lastFailureAt`: subsequent calls return null instantly for FAILURE_BACKOFF_MS, then retry. `inFlight`
-// dedupes concurrent resolves into a single fetch.
+// Module-level cache: undefined = not yet resolved, string = the resolved current build (refreshed
+// after CACHE_TTL_MS). A failed fetch is NOT cached permanently — but to avoid re-stalling every
+// call (e.g. each /infra/status poll and every session start/reconnect) on a firewalled/offline
+// host, a failure is rate-limited by `lastFailureAt`: subsequent calls skip the fetch for
+// FAILURE_BACKOFF_MS and answer the previously resolved build (null if none), then retry.
+// `inFlight` dedupes concurrent resolves into a single fetch.
 const FAILURE_BACKOFF_MS = 60_000;
 // Minimum age a WhatsApp Web build must reach before we'll auto-pin it. The registry's
 // `currentVersion` tracks the latest build, which can be minutes old and unvalidated; a build
 // published at least this long ago is far less likely to hang before reaching QR readiness on a
 // fresh start (the #488 / #684 failure class). Exposed for tests.
 export const WEB_VERSION_SETTLE_MS = 12 * 60 * 60 * 1000; // 12h
+// How long a resolved build is reused before the registry is read again. The registry deletes a
+// build's HTML about 60 days after release, so a pin held for the life of the process eventually 404s
+// and the page silently loads the live build instead.
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 let cachedCurrentVersion: string | undefined;
+let cachedAt = 0;
 let inFlight: Promise<string | null> | null = null;
 let lastFailureAt = 0;
+
+let warnedRemoteTrust = false;
 
 /** Test-only: reset the resolved-version cache between cases. */
 export function __resetWebVersionCache(): void {
   cachedCurrentVersion = undefined;
+  cachedAt = 0;
   inFlight = null;
   lastFailureAt = 0;
+  warnedRemoteTrust = false;
+}
+
+/**
+ * Warn once per process when a remote-HTML pin takes effect. The pinned HTML is fetched over the
+ * network and executed inside the authenticated web.whatsapp.com origin with no integrity check,
+ * so pinning is a trust decision the operator must make knowingly — the log states the source and
+ * the opt-outs. Once-only: resolveWebVersionPin runs on every session (re)start.
+ */
+function warnRemoteTrustOnce(pin: WebVersionPin): void {
+  if (warnedRemoteTrust) return;
+  warnedRemoteTrust = true;
+  logger.warn(
+    'WhatsApp Web build pinned to remote HTML served into the web.whatsapp.com origin WITHOUT an integrity check',
+    {
+      action: 'web_version_remote_pin',
+      webVersion: pin.webVersion,
+      remotePath: pin.webVersionCache.remotePath,
+      optOut:
+        'set WWEBJS_WEB_VERSION=off for the first-party build served by WhatsApp, or point WWEBJS_WEB_VERSION_REMOTE_PATH at an operator-controlled copy',
+    },
+  );
+}
+
+/**
+ * Report a failed registry resolve. Without this the degradation is invisible: the fetch is
+ * swallowed, `resolveWebVersionPin` returns undefined, and the adapter logs only inside
+ * `if (versionPin)` — so a host that cannot reach the registry silently falls back to
+ * whatsapp-web.js's own version selection, which is the failure class the pin exists to prevent
+ * (#488), with nothing in the log to grep for.
+ *
+ * Deliberately NOT once-per-process like `warnRemoteTrustOnce`. The state is ongoing rather than a
+ * one-time decision, and an operator diagnosing a session days into a container's life reads a
+ * bounded log window (`docker compose logs --tail=…`) — a warning emitted only at first failure
+ * would have scrolled away exactly when it is needed. Repetition is already bounded: the
+ * `lastFailureAt` backoff returns before the fetch, so at most one attempt (hence one warning) per
+ * FAILURE_BACKOFF_MS.
+ */
+function warnResolveFailed(reason: string, previous: string | null): void {
+  if (previous) {
+    logger.warn('Could not refresh the WhatsApp Web build from the wa-version registry; keeping the previous pin', {
+      action: 'web_version_refresh_failed',
+      reason,
+      webVersion: previous,
+      registry: WA_VERSION_REGISTRY_URL,
+    });
+    return;
+  }
+  logger.warn('Could not resolve a WhatsApp Web build from the wa-version registry — continuing WITHOUT a pin', {
+    action: 'web_version_resolve_failed',
+    reason,
+    registry: WA_VERSION_REGISTRY_URL,
+    consequence:
+      "whatsapp-web.js selects the build itself, which on some setups authenticates then never reaches 'ready'",
+    remedy:
+      'confirm the host can reach the registry URL, or set WWEBJS_WEB_VERSION to an exact build (or "off" to accept the first-party build)',
+  });
 }
 
 function buildRemotePin(version: string): WebVersionPin {
@@ -74,17 +144,19 @@ export function pickSettledWebVersion(versions: unknown, now: number, currentVer
 
 /**
  * Fetch the current known-good WhatsApp Web build from the wa-version registry. A SUCCESSFUL resolve
- * is cached for the process lifetime; a failure resolves to null WITHOUT caching, so a later call
- * retries (a single transient outage must not permanently defeat the #488 fix). Concurrent callers
- * share one in-flight fetch. Prefers a build that has settled (see `pickSettledWebVersion`) over the
- * registry's possibly-minute-old `currentVersion`.
+ * is cached for CACHE_TTL_MS, then refreshed; a failure is NOT cached, so a later call retries (a
+ * single transient outage must not permanently defeat the #488 fix). A failed refresh keeps the
+ * previous build, and only a process that never resolved one gets null. Concurrent callers share one
+ * in-flight fetch. Prefers a build that has settled (see `pickSettledWebVersion`) over the registry's
+ * possibly-minute-old `currentVersion`.
  */
 export async function resolveCurrentWebVersion(fetcher: typeof fetch = fetch): Promise<string | null> {
-  if (typeof cachedCurrentVersion === 'string') return cachedCurrentVersion;
+  const previous = cachedCurrentVersion ?? null;
+  if (previous && Date.now() - cachedAt < CACHE_TTL_MS) return previous;
   if (inFlight) return inFlight;
-  // Within the backoff window after a recent failure, return null instantly without a network call so
-  // a firewalled/offline host doesn't re-stall on every status poll / session start.
-  if (lastFailureAt && Date.now() - lastFailureAt < FAILURE_BACKOFF_MS) return null;
+  // Within the backoff window after a recent failure, answer instantly without a network call so a
+  // firewalled/offline host doesn't re-stall on every status poll / session start.
+  if (lastFailureAt && Date.now() - lastFailureAt < FAILURE_BACKOFF_MS) return previous;
   inFlight = (async (): Promise<string | null> => {
     try {
       const controller = new AbortController();
@@ -98,16 +170,19 @@ export async function resolveCurrentWebVersion(fetcher: typeof fetch = fetch): P
         const picked = pickSettledWebVersion(json.versions, Date.now(), rawCurrent);
         if (picked) {
           cachedCurrentVersion = picked; // cache only on success
+          cachedAt = Date.now();
           return picked;
         }
         lastFailureAt = Date.now(); // nothing usable — back off, then retry
-        return null;
+        warnResolveFailed('the registry carried no usable build', previous);
+        return previous;
       } finally {
         clearTimeout(timer);
       }
-    } catch {
+    } catch (error) {
       lastFailureAt = Date.now(); // fetch failed — back off, then retry
-      return null;
+      warnResolveFailed(error instanceof Error ? error.message : String(error), previous);
+      return previous;
     } finally {
       inFlight = null;
     }
@@ -120,7 +195,8 @@ export async function resolveCurrentWebVersion(fetcher: typeof fetch = fetch): P
  * - Explicit `WWEBJS_WEB_VERSION` (a version string)  → pin it exactly (no network call).
  * - `off`                                             → no pin; whatsapp-web.js native auto-select.
  * - unset / `auto` / `latest`                         → auto-resolve the current known-good build
- *   from the wa-version registry and pin it; if that fetch fails, fall back to native auto-select.
+ *   from the wa-version registry and pin it; if that fetch fails, keep the previously resolved
+ *   build, or fall back to native auto-select when none was ever resolved.
  * `WWEBJS_WEB_VERSION_REMOTE_PATH` overrides the HTML URL template (`{version}` placeholder).
  * The auto-resolve replaces whatsapp-web.js's unreliable default that caused #488 (scan → stuck →
  * disconnect loop) on Docker setups where no version was pinned.
@@ -129,17 +205,24 @@ export async function resolveWebVersionPin(fetcher: typeof fetch = fetch): Promi
   const raw = process.env.WWEBJS_WEB_VERSION?.trim();
   const lc = raw?.toLowerCase();
   if (raw && lc !== 'off' && lc !== 'latest' && lc !== 'auto') {
-    return buildRemotePin(raw); // operator-pinned exact version
+    const pin = buildRemotePin(raw); // operator-pinned exact version
+    warnRemoteTrustOnce(pin);
+    return pin;
   }
   if (lc === 'off') return undefined; // explicit escape hatch → native auto-select
   const current = await resolveCurrentWebVersion(fetcher);
-  return current ? buildRemotePin(current) : undefined;
+  if (!current) return undefined;
+  const pin = buildRemotePin(current);
+  warnRemoteTrustOnce(pin);
+  return pin;
 }
 
 /**
- * The WhatsApp Web build the engine is effectively using, for the dashboard to display (#488). This
- * is distinct from the whatsapp-web.js library version. `source`: `pinned` = operator-set exact
- * version; `auto` = resolved from the wa-version registry; `native` = whatsapp-web.js auto-select.
+ * The WhatsApp Web build sessions request as their pin, for the dashboard to display (#488). This is
+ * what was asked for, not a read-back: a page can still run another build, which each session logs at
+ * READY (./adapters/wwebjs-running-build). It is distinct from the whatsapp-web.js library version.
+ * `source`: `pinned` = operator-set exact version; `auto` = resolved from the wa-version registry;
+ * `native` = whatsapp-web.js auto-select.
  */
 export function getEffectiveWebVersionInfo(): { version: string | null; source: 'pinned' | 'auto' | 'native' } {
   const raw = process.env.WWEBJS_WEB_VERSION?.trim();

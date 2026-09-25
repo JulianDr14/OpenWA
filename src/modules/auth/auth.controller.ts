@@ -3,13 +3,16 @@ import { ApiTags, ApiOperation, ApiResponse } from '@nestjs/swagger';
 import type { Request } from 'express';
 import { AuthService } from './auth.service';
 import { CreateApiKeyDto, UpdateApiKeyDto, ApiKeyResponseDto, ApiKeyCreatedResponseDto } from './dto';
-import { RequireRole, CurrentApiKey } from './decorators/auth.decorators';
+import { RequireRole, CurrentApiKey, RequireUnscopedKey } from './decorators/auth.decorators';
 import { type ApiKey, ApiKeyRole } from './entities/api-key.entity';
 import { AuditService } from '../audit/audit.service';
 import { AuditAction } from './../audit/entities/audit-log.entity';
 
 @ApiTags('auth')
 @Controller('auth/api-keys')
+// Key lifecycle routes have no session dimension, so a session-scoped ADMIN key could otherwise
+// escape its confinement here (mint an unrestricted key, or clear another key's allowedSessions).
+@RequireUnscopedKey()
 export class AuthController {
   constructor(
     private readonly authService: AuthService,
@@ -55,6 +58,7 @@ export class AuthController {
       role: apiKey.role,
       allowedIps: apiKey.allowedIps || undefined,
       allowedSessions: apiKey.allowedSessions || undefined,
+      allowedChats: apiKey.allowedChats || undefined,
       isActive: apiKey.isActive,
       expiresAt: apiKey.expiresAt || undefined,
       lastUsedAt: apiKey.lastUsedAt || undefined,
@@ -81,6 +85,7 @@ export class AuthController {
       role: k.role,
       allowedIps: k.allowedIps || undefined,
       allowedSessions: k.allowedSessions || undefined,
+      allowedChats: k.allowedChats || undefined,
       isActive: k.isActive,
       expiresAt: k.expiresAt || undefined,
       lastUsedAt: k.lastUsedAt || undefined,
@@ -106,6 +111,7 @@ export class AuthController {
       role: k.role,
       allowedIps: k.allowedIps || undefined,
       allowedSessions: k.allowedSessions || undefined,
+      allowedChats: k.allowedChats || undefined,
       isActive: k.isActive,
       expiresAt: k.expiresAt || undefined,
       lastUsedAt: k.lastUsedAt || undefined,
@@ -131,6 +137,7 @@ export class AuthController {
       role: key.role,
       allowedIps: key.allowedIps,
       allowedSessions: key.allowedSessions,
+      allowedChats: key.allowedChats,
       expiresAt: key.expiresAt,
     });
     await this.auditService.logInfo(AuditAction.API_KEY_UPDATED, {
@@ -149,6 +156,7 @@ export class AuthController {
       role: k.role,
       allowedIps: k.allowedIps || undefined,
       allowedSessions: k.allowedSessions || undefined,
+      allowedChats: k.allowedChats || undefined,
       isActive: k.isActive,
       expiresAt: k.expiresAt || undefined,
       lastUsedAt: k.lastUsedAt || undefined,
@@ -195,6 +203,7 @@ export class AuthController {
       role: k.role,
       allowedIps: k.allowedIps || undefined,
       allowedSessions: k.allowedSessions || undefined,
+      allowedChats: k.allowedChats || undefined,
       isActive: k.isActive,
       expiresAt: k.expiresAt || undefined,
       lastUsedAt: k.lastUsedAt || undefined,

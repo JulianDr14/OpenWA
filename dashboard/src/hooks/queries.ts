@@ -27,8 +27,7 @@ export const queryKeys = {
   webhooks: ['webhooks'] as const,
   templates: (sessionId: string) => ['sessions', sessionId, 'templates'] as const,
   apiKeys: ['apiKeys'] as const,
-  logs: (params: { severity?: string; page: number; limit: number }) =>
-    ['logs', params] as const,
+  logs: (params: { severity?: string; page: number; limit: number }) => ['logs', params] as const,
   infraStatus: ['infra', 'status'] as const,
   plugins: ['plugins'] as const,
   pluginInstances: (pluginId: string) => ['plugins', pluginId, 'instances'] as const,
@@ -78,7 +77,8 @@ export function useStopSessionMutation() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => sessionApi.stop(id),
-    onSuccess: () => {
+    // A failed stop can still have changed the session, so the list is re-read either way.
+    onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.sessions });
     },
   });
@@ -123,8 +123,7 @@ export function useUpdateWebhookMutation() {
 export function useDeleteWebhookMutation() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (params: { sessionId: string; id: string }) =>
-      webhookApi.delete(params.sessionId, params.id),
+    mutationFn: (params: { sessionId: string; id: string }) => webhookApi.delete(params.sessionId, params.id),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.webhooks });
     },
@@ -167,8 +166,7 @@ export function useUpdateTemplateMutation() {
 export function useDeleteTemplateMutation() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (params: { sessionId: string; id: string }) =>
-      templateApi.delete(params.sessionId, params.id),
+    mutationFn: (params: { sessionId: string; id: string }) => templateApi.delete(params.sessionId, params.id),
     onSuccess: (_template, params) => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.templates(params.sessionId) });
     },
@@ -188,8 +186,35 @@ export function useApiKeysQuery() {
 export function useCreateApiKeyMutation() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (data: { name: string; role: string; allowedIps?: string[]; allowedSessions?: string[]; expiresAt?: string }) =>
-      apiKeyApi.create(data),
+    mutationFn: (data: {
+      name: string;
+      role: string;
+      allowedIps?: string[];
+      allowedSessions?: string[];
+      expiresAt?: string;
+    }) => apiKeyApi.create(data),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.apiKeys });
+    },
+  });
+}
+
+export function useUpdateApiKeyMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      id,
+      data,
+    }: {
+      id: string;
+      data: {
+        name?: string;
+        role?: string;
+        allowedIps?: string[];
+        allowedSessions?: string[];
+        expiresAt?: string;
+      };
+    }) => apiKeyApi.update(id, data),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.apiKeys });
     },

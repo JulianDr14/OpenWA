@@ -22,9 +22,12 @@ client = OpenWAClient(
     api_key="owa_k1_…",
 )
 
-client.sessions.start("my-session")
+# Sessions are addressed by the UUID that create() returns, not by name. Create a session once;
+# afterwards, find its id with client.sessions.list({"name": "my-session"}).
+session = client.sessions.create({"name": "my-session"})
+client.sessions.start(session["id"])
 
-result = client.messages.send_text("my-session", {
+result = client.messages.send_text(session["id"], {
     "chatId": "628123456789@c.us",
     "text": "Hello from the OpenWA Python SDK!",
 })
@@ -35,7 +38,7 @@ The client is also a context manager (it closes the underlying connection pool o
 
 ```python
 with OpenWAClient(base_url="…", api_key="…") as client:
-    client.messages.send_text("my-session", {"chatId": "…@c.us", "text": "hi"})
+    client.messages.send_text(session_id, {"chatId": "…@c.us", "text": "hi"})
 ```
 
 For tests, pass an httpx transport — no global monkey-patching required:
@@ -54,7 +57,7 @@ The active search provider (built-in DB full-text, or a plugin) answers; if none
 is configured the server returns 501.
 
 ```python
-res = client.search.search({"q": "invoice", "sessionId": "my-session", "limit": 20})
+res = client.search.search({"q": "invoice", "sessionId": session_id, "limit": 20})
 for hit in res["hits"]:
     print(hit["snippet"], hit["score"])
 ```
@@ -67,14 +70,22 @@ for hit in res["hits"]:
 
 A non-2xx response raises a typed `OpenWAApiError` subclass — `OpenWAAuthError` (401),
 `OpenWAForbiddenError` (403), `OpenWANotFoundError` (404), `OpenWAConflictError` (409),
-`OpenWARateLimitError` (429), `OpenWANotImplementedError` (501) — each carrying `.status`
-and the parsed `.body`. A timeout raises `OpenWATimeoutError`.
+`OpenWARateLimitError` (429), `OpenWANotImplementedError` (501),
+`OpenWAServiceUnavailableError` (503) — each carrying `.status` and the parsed `.body`. A
+timeout raises `OpenWATimeoutError`. 503 is transient, but a catalog 503 can persist because
+WhatsApp may never answer that query, so bound any retry. A 429 from the global rate limiter
+lifts when its window expires (seconds for the per-second tier, up to an hour for the hourly
+tier by default); its delay is only in the `Retry-After` response header, which the error does
+not carry. A 429 whose body has `code: "SEND_PACING_LIMITED"` is not transient: do not retry it
+before the body's `retryAfterSeconds`, which can be hours. In a routed deployment only 503
+proves the request was never carried out: a forward that fails after the request reached the
+owner node answers 502 or 504.
 
 ```python
 from openwa import OpenWANotFoundError
 
 try:
-    client.sessions.get("missing")
+    client.sessions.get("00000000-0000-0000-0000-000000000000")
 except OpenWANotFoundError as e:
     print(e.status)  # 404
 ```
@@ -87,6 +98,34 @@ except OpenWANotFoundError as e:
   reverse proxy) is preserved.
 - Escape hatch for endpoints the SDK does not wrap:
   `client.request(method, path, query=…, body=…)`.
+
+## Releasing
+
+Publishing to PyPI is done by the
+[`python-sdk-release.yml`](../../.github/workflows/python-sdk-release.yml)
+workflow, which authenticates with **PyPI Trusted Publishing (OIDC)**. There is
+no PyPI token in the workflow or in the repository secrets: PyPI mints a
+short-lived credential from the GitHub OIDC token, so nothing long-lived exists
+to leak or rotate.
+
+One-time setup, required **before** the first tag — on pypi.org, open the
+project's publishing settings and add a GitHub trusted publisher:
+
+- Owner: `rmyndharis`
+- Repository: `OpenWA`
+- Workflow name: `python-sdk-release.yml`
+
+There are no repository secrets to add. Until the trusted publisher exists PyPI
+rejects the upload, so configure it first.
+
+Cutting a release:
+
+1. Bump `version` in `pyproject.toml` and land it on `main`.
+2. Tag that commit `py-sdk-v<version>` (e.g. `py-sdk-v0.5.0`) and push the tag.
+   The SDK has its own version line — the monorepo's `v*` tags are the app
+   version and never trigger an SDK publish.
+3. The workflow re-runs the test suite, builds the sdist and wheel, and
+   uploads. The artifacts published are the ones those tests passed against.
 
 ## License
 

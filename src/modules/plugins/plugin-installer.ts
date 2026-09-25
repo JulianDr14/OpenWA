@@ -2,7 +2,11 @@ import AdmZip from 'adm-zip';
 import * as path from 'path';
 import * as zlib from 'zlib';
 import { BadRequestException } from '@nestjs/common';
-import { PluginManifest, PluginType } from '../../core/plugins';
+import { PluginManifest, RESERVED_PLUGIN_IDS, INSTALLABLE_TYPES, validatePluginManifest } from '../../core/plugins';
+
+// Re-exported so existing importers of this module keep working; the definitions live in
+// core/plugins/plugin-manifest.ts, shared with the boot-time loader validation.
+export { RESERVED_PLUGIN_IDS, INSTALLABLE_TYPES };
 
 export interface PackageLimits {
   /** Max number of files in the archive (cheap zip-bomb / fork-bomb guard). */
@@ -12,19 +16,6 @@ export interface PackageLimits {
 }
 
 export const DEFAULT_PACKAGE_LIMITS: PackageLimits = { maxEntries: 200, maxTotalBytes: 20 * 1024 * 1024 };
-
-/**
- * Plugin ids an uploaded package must never use. `whatsapp-web.js` / `baileys` are built-in engines;
- * `auto-reply` / `translation` are the legacy bundled-extension ids (removed in v0.7 — superseded by
- * the marketplace `chat-flow` / `group-translate`) kept reserved so a re-upload can't shadow them.
- */
-export const RESERVED_PLUGIN_IDS = new Set(['whatsapp-web.js', 'baileys', 'auto-reply', 'translation']);
-
-/** Only extensions are user-installable; engines (and other tiers) are built-in by design. */
-export const INSTALLABLE_TYPES = new Set<string>([PluginType.EXTENSION]);
-
-const SAFE_ID = /^[a-z0-9][a-z0-9._-]*$/i;
-const REQUIRED_FIELDS = ['id', 'name', 'version', 'type', 'main'] as const;
 
 /**
  * Decompress one zip entry with a hard cap on actual output bytes. adm-zip only forwards zlib
@@ -58,14 +49,17 @@ export interface ParsedPackage {
  * over-size archives). The caller writes the returned entries; this function decides what is safe.
  */
 export function parsePluginPackage(buffer: Buffer, limits: PackageLimits = DEFAULT_PACKAGE_LIMITS): ParsedPackage {
-  let zip: AdmZip;
+  // The constructor reads only the end-of-central-directory record; the central directory itself is
+  // parsed lazily by getEntries(), so an archive whose trailer parses and whose directory does not
+  // escaped this guard as a plain Error and reached the caller as a 500. Both answer the same
+  // question, "is this a readable archive", so both are caught here.
+  let files: AdmZip.IZipEntry[];
   try {
-    zip = new AdmZip(buffer);
+    files = new AdmZip(buffer).getEntries().filter(e => !e.isDirectory);
   } catch {
     throw new BadRequestException('Uploaded file is not a valid .zip archive');
   }
 
-  const files = zip.getEntries().filter(e => !e.isDirectory);
   if (files.length === 0) throw new BadRequestException('The archive is empty');
   if (files.length > limits.maxEntries) throw new BadRequestException('The archive has too many files');
 
@@ -91,31 +85,16 @@ export function parsePluginPackage(buffer: Buffer, limits: PackageLimits = DEFAU
   } catch {
     throw new BadRequestException('manifest.json is not valid JSON');
   }
-  // JSON.parse("null") / "[]" / "5" don't throw — but indexing a field on a non-object then throws an
-  // uncaught TypeError (HTTP 500) on the attacker-controlled install path. Require a plain object.
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    throw new BadRequestException('manifest.json must be a JSON object');
+  // The SAME manifest validation the boot-time loader enforces (shape, required string fields, id
+  // format + reserved ids, extension-only type, contained `main`) — shared so the two entry points
+  // can never drift apart. Mapped to a clean 400 here, never an uncaught TypeError (HTTP 500) on
+  // the attacker-controlled install path.
+  try {
+    validatePluginManifest(parsed);
+  } catch (error) {
+    throw new BadRequestException(error instanceof Error ? error.message : String(error));
   }
-  const manifest = parsed as PluginManifest;
-  for (const field of REQUIRED_FIELDS) {
-    // Require a non-empty STRING: a non-string value (e.g. `main: 123`) is truthy and would pass a
-    // bare falsy check, then crash a string-only API like path.posix.normalize with an uncaught
-    // TypeError (HTTP 500). Reject it cleanly as a 400 here.
-    if (typeof manifest[field] !== 'string' || manifest[field].length === 0) {
-      throw new BadRequestException(`manifest.json is missing or has an invalid required field: ${field}`);
-    }
-  }
-  if (!SAFE_ID.test(manifest.id) || manifest.id.includes('..')) {
-    throw new BadRequestException(`Invalid plugin id: "${manifest.id}"`);
-  }
-  if (RESERVED_PLUGIN_IDS.has(manifest.id.toLowerCase())) {
-    throw new BadRequestException(`Plugin id "${manifest.id}" is reserved by a built-in plugin`);
-  }
-  if (!INSTALLABLE_TYPES.has(manifest.type)) {
-    throw new BadRequestException(
-      `Plugin type "${manifest.type}" is not installable — only extension plugins can be installed (engines and other tiers are built-in).`,
-    );
-  }
+  const manifest = parsed;
 
   // Size guard FIRST, off the declared header sizes, so a zip bomb is rejected before we decompress.
   const packaged = files.filter(e => !prefix || e.entryName.startsWith(prefix));

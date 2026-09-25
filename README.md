@@ -33,16 +33,45 @@
 
 Built on a **pluggable architecture**, OpenWA lets you select database engines (SQLite/PostgreSQL), backup/migration storage backends (Local/S3), and cache layers (disabled/Redis) through configuration rather than application-code changes. Message media itself is returned inline to API and webhook consumers; it is not automatically persisted to the storage backend.
 
-|                               |                                                                                            |
-| ----------------------------- | ------------------------------------------------------------------------------------------ |
-| 🔓 **100% Open Source**       | No licensing fees, no feature locks, full source code access                               |
-| 🏗️ **Pluggable Architecture** | Swap adapters for database, storage, and cache via config                                  |
-| 🖥️ **Full Dashboard**         | Modern React UI for session, webhook, and API key management                               |
-| 🔹 **Multi-Session Ready**    | Run multiple WhatsApp sessions concurrently on one instance                                |
-| 🐳 **Docker Native**          | Production-ready with zero configuration                                                   |
+|                               |                                                                                                                                          |
+| ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| 🔓 **100% Open Source**       | No licensing fees, no feature locks, full source code access                                                                             |
+| 🏗️ **Pluggable Architecture** | Swap adapters for database, storage, and cache via config                                                                                |
+| 🖥️ **Full Dashboard**         | Modern React UI for session, webhook, and API key management                                                                             |
+| 🔹 **Multi-Session Ready**    | Run multiple WhatsApp sessions concurrently on one instance                                                                              |
+| 🐳 **Docker Native**          | Production-ready with zero configuration                                                                                                 |
 | 🧩 **Official Plugins**       | Chatwoot, Typebot & more as sandboxed plugins on the Integration Fabric — [OpenWA-plugins](https://github.com/rmyndharis/OpenWA-plugins) |
-| 🔗 **n8n Integration**        | Community nodes for workflow automation                                                    |
-| 🧩 **Community Adapters**     | Third-party integrations (e.g. ioBroker) — see [docs](./docs/23-community-integrations.md) |
+| 🔗 **n8n Integration**        | Community nodes for workflow automation                                                                                                  |
+| 🧩 **Community Adapters**     | Third-party integrations (e.g. ioBroker) — see [docs](./docs/23-community-integrations.md)                                               |
+| 🔐 **Session-scoped keys**    | Operator and viewer (reader) tokens can be limited to chosen sessions — or all sessions if none are selected                             |
+| 🔒 **Chat-scoped keys**       | Those same tokens can also be limited to chosen chats — a few groups and contacts — so an agent on a shared account sees only its own    |
+
+### Session-scoped operator & viewer tokens
+
+When you create or edit an **operator** or **viewer** API key in the dashboard, you can tick the WhatsApp sessions that key may use.
+
+- **No sessions selected** — the key can access every session, including ones created later.
+- **One or more sessions selected** — the key can only list, read, and (for operator) manage those sessions. A request naming any other session returns `401`; session-filtered lists (sessions, audit, webhook delivery failures) return that key's rows rather than an error; and the key-management routes and the queue dashboard, which name no session at all, return `403`.
+
+Admin keys stay unscoped in the dashboard so they can keep managing other API keys. The HTTP API still accepts `allowedSessions` on any role if you need that from a client.
+
+### Chat-scoped operator & viewer tokens
+
+A session-scoped key still reaches every chat on the sessions it may use. A key can be narrowed further, to **chats** (a chosen set of groups and individual contacts), with `allowedChats` on `POST /auth/api-keys` or `PUT /auth/api-keys/{id}`. The dashboard does not set or show it yet, and editing a key there leaves its chats unchanged.
+
+- **No chats selected** — the key can reach every chat on its sessions.
+- **One or more selected** — the key reaches only those chats. Every authenticated REST route not explicitly marked as safe for a chat-scoped key refuses it with `403` (a request naming a session outside `allowedSessions` still answers `401` first), including routes added in later releases: the refusal is the default. Inside its chats an operator key can do what the marked routes allow, which is more than reading and sending: it can also delete or clear a chat, leave or rename a group, and block the contact. It cannot change who belongs to a group: adding, removing, promoting or demoting participants, answering join requests and reading or resetting the invite link all stay closed.
+- **The two scopes are independent** — a key may be limited to sessions, to chats, to both, or to neither.
+
+This lets you point an **AI agent or third-party integration at a shared account** without handing it every chat. Give the agent a key scoped to the few groups (or DMs) it is meant to handle: it can send and reply there, but it cannot list your other chats, read any other DM, message a contact outside its set, or reach the queue dashboard. It reads its chats through `GET /sessions/{sessionId}/messages/{chatId}/history`, which works on whatsapp-web.js only; on Baileys it sees just each chat's last-message preview. It receives no pushed events, so it has to poll. It can still read the session's own status (`GET /sessions/{sessionId}`) so an integration can tell whether it is connected.
+
+Identity is matched through the lid mapping table: a contact allowlisted by phone number also matches the same person's `@lid` privacy id once the table maps the two, and an unmapped `@lid` is refused rather than guessed. A lid's digits are never mistaken for a phone number, so `555000111@lid` does not admit `555000111@c.us`.
+
+The default covers REST routes only. Surfaces that authenticate outside the REST guard do not inherit it, so each one that can return chat data refuses a chat-scoped key with its own check: the `/events` WebSocket, the MCP mount (per tool call), and the Bull Board queue dashboard. Of the list routes, only `GET /sessions/{sessionId}/chats` is usable, and it filters to the key's chats before paging.
+
+The API also accepts `allowedChats` on an admin key, but no admin-only route is open to a chat-scoped key, and the last usable admin key cannot be scoped this way.
+
+None of this changes the ban-risk guidance below. It limits what a _key_ can reach, not what WhatsApp makes of the account.
 
 ---
 
@@ -104,28 +133,29 @@ For any deployment where ethical, legal, or regulatory compliance matters (healt
 
 ### Messaging
 
-| Feature           | Status | Description                                  |
-| ----------------- | ------ | -------------------------------------------- |
-| Text Messages     | ✅     | Send/receive text messages                   |
-| Media Messages    | ✅     | Images, videos, documents, audio             |
-| Message Reactions | ✅     | React to messages with emoji                 |
-| Message Editing   | ✅     | Send edits + live `message.edited` events on both engines  |
-| Bulk Messaging    | ✅     | Send to multiple recipients                  |
-| Message Status    | ✅     | Track delivery and read receipts             |
+| Feature           | Status | Description                                               |
+| ----------------- | ------ | --------------------------------------------------------- |
+| Text Messages     | ✅     | Send/receive text messages                                |
+| Media Messages    | ✅     | Images, videos, documents, audio                          |
+| Message Reactions | ✅     | React to messages with emoji                              |
+| Message Editing   | ✅     | Send edits + live `message.edited` events on both engines |
+| Bulk Messaging    | ✅     | Send to multiple recipients                               |
+| Message Status    | ✅     | Track delivery and read receipts                          |
 
 ### Advanced
 
-| Feature             | Status | Description                        |
-| ------------------- | ------ | ---------------------------------- |
-| Groups API          | ✅     | Create, manage, join (invite code), and configure groups |
-| Profile Management  | ✅     | Set own display name, about text, and profile picture    |
-| Call Handling       | ✅     | `call.received` events, reject calls, per-session auto-reject |
-| Channels/Newsletter | ✅     | WhatsApp Channels support          |
-| Labels Management   | ✅     | Organize chats with labels         |
-| Proxy Support       | ✅     | Per-session proxy configuration    |
-| Rate Limiting       | ✅     | Configurable request limits        |
-| CIDR Whitelisting   | ✅     | IP-based access control            |
-| Audit Logging       | ✅     | Track all API operations           |
+| Feature             | Status | Description                                                                                                                                                                  |
+| ------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Groups API          | ✅     | Create, manage, join (invite code), and configure groups                                                                                                                     |
+| Profile Management  | ✅     | Set own display name, about text, and profile picture                                                                                                                        |
+| Call Handling       | ✅     | `call.received` events (not reliable on whatsapp-web.js), reject calls and per-session auto-reject (Baileys only)                                                            |
+| Channels/Newsletter | ✅     | WhatsApp Channels support                                                                                                                                                    |
+| Labels Management   | ✅     | Organize chats with labels                                                                                                                                                   |
+| Proxy Support       | ✅     | Per-session proxy configuration                                                                                                                                              |
+| Rate Limiting       | ✅     | Configurable request limits                                                                                                                                                  |
+| CIDR Whitelisting   | ✅     | IP-based access control                                                                                                                                                      |
+| Chat Scoping        | ✅     | Per-key `allowedChats` allowlist (groups and contacts): a key reaches only those chats, and routes not marked safe for it refuse it                                          |
+| Audit Logging       | ✅     | Audit trail for API-key, session, integration-instance, and infra admin operations (message sends and webhook deliveries are tracked in their own tables, not the audit log) |
 
 ### Infrastructure
 
@@ -175,8 +205,8 @@ docker compose -f docker-compose.dev.yml up -d
 git clone https://github.com/rmyndharis/OpenWA.git
 cd OpenWA
 
-# Install dependencies (includes dashboard)
-npm install
+# Install the locked dependencies (includes dashboard)
+npm ci
 
 # Start API + Dashboard (config is auto-generated on first run)
 npm run dev
@@ -186,6 +216,10 @@ npm run dev
 # API: http://localhost:2785/api
 # Swagger: http://localhost:2785/api/docs
 ```
+
+Use `npm install` instead when intentionally changing dependencies. OpenWA's committed lockfile uses
+registry artifacts only, so npm 12 works with its secure default that blocks Git dependencies; do not
+disable that policy globally.
 
 ---
 
@@ -199,7 +233,7 @@ The production stack never exposes `/var/run/docker.sock` directly to the applic
 openwa-api  ──TCP 2375──▶  docker-proxy  ──unix──▶  /var/run/docker.sock
 ```
 
-Only the operations needed for container orchestration are enabled (`CONTAINERS`, `IMAGES`, `VOLUMES`, `INFO`, `PING`, `POST`, `DELETE`). The application connects via the `DOCKER_HOST=tcp://docker-proxy:2375` environment variable, which `DockerService` detects automatically.
+Only the operations needed for container orchestration are enabled (`CONTAINERS`, `IMAGES`, `VOLUMES`, `INFO`, `PING`, plus the `POST` method switch). The application connects via the `DOCKER_HOST=tcp://docker-proxy:2375` environment variable, which `DockerService` detects automatically. Note this is an operational gateway, not a fine-grained privilege boundary: with `POST` enabled the proxy admits every method to the enabled paths and cannot scope container-create payloads, so a compromised API container would be host-root-equivalent — see `SECURITY.md` for the full threat model, mitigations, and how to disable the proxy if you don't use the built-in datastore orchestration.
 
 ### Non-root Container Execution
 
@@ -227,10 +261,10 @@ For production, use the main `docker-compose.yml` with optional services:
 # Basic production (SQLite, local storage)
 docker compose up -d
 
-# With PostgreSQL database
+# Also start the PostgreSQL container (configure it first, see below)
 docker compose --profile postgres up -d
 
-# Full stack (PostgreSQL, Redis, MinIO)
+# Also start PostgreSQL, Redis and MinIO (configure them first, see below)
 docker compose --profile full up -d
 ```
 
@@ -240,6 +274,20 @@ docker compose --profile full up -d
 | `redis`    | Redis cache           |
 | `minio`    | S3-compatible storage |
 | `full`     | All services above    |
+
+A profile only starts the container; OpenWA keeps using SQLite and local storage until it is told
+to use the new service. The simplest route is **Dashboard > Infrastructure**: pick the built-in
+option, save, and restart from there, and OpenWA starts the container itself. To use a profile
+directly, set these in the `.env` next to `docker-compose.yml` first:
+
+- PostgreSQL: `DATABASE_TYPE=postgres`, `DATABASE_HOST=postgres`, `DATABASE_USERNAME=openwa`,
+  `DATABASE_PASSWORD=<strong password>`
+- Redis: `REDIS_ENABLED=true`, `REDIS_HOST=redis`
+- MinIO: `STORAGE_TYPE=s3`, `S3_ENDPOINT=http://minio:9000`, `S3_ACCESS_KEY_ID=<user>`,
+  `S3_SECRET_ACCESS_KEY=<strong password>`
+
+PostgreSQL and MinIO refuse to initialize with an empty password, and a production boot rejects
+default credentials such as `openwa` or `minioadmin`.
 
 > The dashboard is bundled into the API image and served by NestJS on the API port, so it
 > needs no profile — it is always available wherever `openwa-api` runs. For TLS/public exposure,
@@ -258,11 +306,11 @@ docker compose --profile full up -d
 
 ## 🔌 Ports
 
-| Service         | Port            | Description                                     |
-| --------------- | --------------- | ----------------------------------------------- |
-| API & Dashboard | `2785`          | REST API + bundled web dashboard (same port)    |
-| Swagger         | `2785/api/docs` | Interactive API docs                            |
-| Dashboard (dev) | `2886`          | Vite dev server with hot reload (`npm run dev`) |
+| Service         | Port            | Description                                                                         |
+| --------------- | --------------- | ----------------------------------------------------------------------------------- |
+| API & Dashboard | `2785`          | REST API + bundled web dashboard (same port)                                        |
+| Swagger         | `2785/api/docs` | Interactive API docs — off under `NODE_ENV=production` unless `ENABLE_SWAGGER=true` |
+| Dashboard (dev) | `2886`          | Vite dev server with hot reload (`npm run dev`)                                     |
 
 ---
 
@@ -316,14 +364,16 @@ curl -X POST http://localhost:2785/api/sessions/{sessionId}/webhooks \
 
 > **Smart filters (optional):** add a `filters` object to fire the webhook only when conditions match
 > (AND), e.g. `{ "conditions": [{ "field": "sender", "operator": "is", "value": ["1234567890@c.us"] }] }`.
-> Fields: `sender` / `recipient` / `body` / `type` / `mentions` / `fromMe` / `hasMedia` / `isGroup`. A
-> webhook with no filters behaves exactly as before. See the API specification for the full schema.
+> Fields: `sender` / `recipient` / `chatId` / `body` / `type` / `mentions` / `fromMe` / `hasMedia` /
+> `isGroup` / `kind`. A webhook with no filters behaves exactly as before. Use `chatId` to allowlist
+> specific groups or DMs (e.g. `{ "field": "chatId", "operator": "is", "value": ["120…@g.us"] }`).
+> See the API specification for the full schema.
 
 ## 🤖 MCP Server (AI Agents)
 
 OpenWA can expose a **curated set of tools over the [Model Context Protocol](https://modelcontextprotocol.io)** so AI agents (Claude, Cursor, …) can drive WhatsApp. It is **off by default** and **additive** — every REST route keeps working unchanged.
 
-Set `MCP_ENABLED=true` to mount a stateless Streamable-HTTP transport at **`POST /mcp`** on the existing server (same port, no extra process). It exposes ~39 curated tools (sessions, messaging, contacts, basic group ops, webhook reads) — a focused surface rather than the full API, so agents aren't overwhelmed and destructive operations stay off the agent path.
+Set `MCP_ENABLED=true` to mount a stateless Streamable-HTTP transport at **`POST /mcp`** on the existing server (same port, no extra process). It mounts **25 read-only tools** by default — session, message, contact, group, webhook, label and automation-rule _reads_ — because the surface is read-only unless you opt out. Add `MCP_READONLY=false` to mount all **51 tools**, adding the write tier (send, reply, group operations). Either way it is a focused surface rather than the full API, so agents aren't overwhelmed.
 
 ```bash
 MCP_ENABLED=true npm run start:prod   # or set MCP_ENABLED in your .env / compose

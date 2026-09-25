@@ -1,8 +1,9 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
+import { ConfigService } from '@nestjs/config';
 import { Repository } from 'typeorm';
 import { Session, SessionStatus } from '../session/entities/session.entity';
-import { Message, MessageStatus } from '../message/entities/message.entity';
+import { Message, MessageDirection, MessageStatus } from '../message/entities/message.entity';
 import { CacheService } from '../../common/cache';
 
 /**
@@ -41,6 +42,13 @@ export function maxCreatedAtSql(dbType: string): string {
     : `strftime('%Y-%m-%d %H:%M:%S', MAX(m.createdAt))`;
 }
 
+/**
+ * SQL for a top chat's label. `chatName` holds the SENDER's push name, not the chat's: MAX over a group's
+ * rows named the group after whichever member sorts last. Only a 1:1 chat's inbound rows carry the name
+ * of the chat itself, so groups get null and the dashboard falls back to the chat id.
+ */
+const CHAT_LABEL_SQL = `MAX(CASE WHEN m.direction = '${MessageDirection.INCOMING}' AND m.chatId NOT LIKE '%@g.us' THEN m.chatName END)`;
+
 export interface OverviewStats {
   sessions: {
     active: number;
@@ -77,12 +85,25 @@ export interface SessionStats {
 
 @Injectable()
 export class StatsService {
+  /**
+   * In-process TTL memo for the aggregate responses, keyed by query shape ('overview',
+   * 'messages:<period>', 'session:<id>'). The aggregates run GROUP BY scans over the whole
+   * messages table — on the default SQLite backend synchronously on the event loop — so
+   * dashboard polling would otherwise re-run them on every request. TTL-only invalidation:
+   * entries expire after stats.cacheTtlMs; there is no write-path hook. Session-scoped entries
+   * are additionally re-validated on serve (getSessionStats), so a deleted session is not
+   * resurrected from the memo. Key cardinality is
+   * bounded (4 global shapes + one per session), so no size eviction is needed.
+   */
+  private readonly memo = new Map<string, { expiresAt: number; value: unknown }>();
+
   constructor(
     @InjectRepository(Session, 'data')
     private readonly sessionRepo: Repository<Session>,
     @InjectRepository(Message, 'data')
     private readonly messageRepo: Repository<Message>,
     private readonly cacheService: CacheService,
+    private readonly configService: ConfigService,
   ) {}
 
   /** The data-connection dialect ('sqlite' | 'postgres'), used to pick portable date SQL. */
@@ -90,7 +111,28 @@ export class StatsService {
     return this.messageRepo.manager.dataSource.options.type;
   }
 
+  /** Memo TTL in ms; 0 disables memoization (every request hits the DB). Read per call. */
+  private get memoTtlMs(): number {
+    return this.configService.get<number>('stats.cacheTtlMs', 30000);
+  }
+
+  /** Returns the memoized value for `key` while fresh; otherwise computes, stores, returns it. */
+  private async memoized<T>(key: string, compute: () => Promise<T>): Promise<T> {
+    const ttl = this.memoTtlMs;
+    if (ttl <= 0) return compute();
+    const now = Date.now();
+    const hit = this.memo.get(key);
+    if (hit && hit.expiresAt > now) return hit.value as T;
+    const value = await compute();
+    this.memo.set(key, { expiresAt: now + ttl, value });
+    return value;
+  }
+
   async getOverview(): Promise<OverviewStats> {
+    return this.memoized('overview', () => this.loadOverview());
+  }
+
+  private async loadOverview(): Promise<OverviewStats> {
     // Get session stats
     const sessions = await this.sessionRepo.find();
     const byStatus: Record<string, number> = {};
@@ -153,6 +195,10 @@ export class StatsService {
   }
 
   async getMessageStats(period: '24h' | '7d' | '30d'): Promise<MessageStats> {
+    return this.memoized(`messages:${period}`, () => this.loadMessageStats(period));
+  }
+
+  private async loadMessageStats(period: '24h' | '7d' | '30d'): Promise<MessageStats> {
     const since = this.getPeriodStart(period);
     const interval = period === '24h' ? 'hour' : 'day';
 
@@ -167,7 +213,8 @@ export class StatsService {
       .select('m.type', 'type')
       .addSelect('COUNT(*)', 'count')
       .where('m.createdAt >= :since', { since })
-      .andWhere("(m.body IS NOT NULL AND m.body != '') OR m.metadata IS NOT NULL")
+      // Parenthesized: TypeORM does not wrap an andWhere, so a bare OR would escape the period bound.
+      .andWhere("((m.body IS NOT NULL AND m.body != '') OR m.metadata IS NOT NULL)")
       .groupBy('m.type')
       .getRawMany<{ type: string; count: string }>();
 
@@ -211,7 +258,7 @@ export class StatsService {
       .createQueryBuilder('m')
       .select('m.chatId', 'chatId')
       .addSelect('COUNT(*)', 'messageCount')
-      .addSelect('MAX(m.chatName)', 'chatName')
+      .addSelect(CHAT_LABEL_SQL, 'chatName')
       .where('m.createdAt >= :since', { since })
       .groupBy('m.chatId')
       // Order by the aggregate expression, not the "messageCount" alias: Postgres folds an unquoted
@@ -233,6 +280,19 @@ export class StatsService {
   }
 
   async getSessionStats(sessionId: string): Promise<SessionStats> {
+    // The memo has no write-path hook, so a `session:<id>` entry can outlive its session row and
+    // would keep serving a deleted session's stats until the TTL expires. Re-check existence on
+    // every call — a cheap primary-key lookup next to the aggregate scans the memo exists to
+    // avoid — and drop the stale entry instead of serving it.
+    const key = `session:${sessionId}`;
+    if ((await this.sessionRepo.count({ where: { id: sessionId } })) === 0) {
+      this.memo.delete(key);
+      throw new NotFoundException('Session not found');
+    }
+    return this.memoized(key, () => this.loadSessionStats(sessionId));
+  }
+
+  private async loadSessionStats(sessionId: string): Promise<SessionStats> {
     const session = await this.sessionRepo.findOne({ where: { id: sessionId } });
     if (!session) {
       throw new NotFoundException('Session not found');
@@ -270,7 +330,7 @@ export class StatsService {
       .select('m.chatId', 'chatId')
       .addSelect('COUNT(*)', 'count')
       .addSelect(maxCreatedAtSql(this.dataDbType), 'lastActive')
-      .addSelect('MAX(m.chatName)', 'chatName')
+      .addSelect(CHAT_LABEL_SQL, 'chatName')
       .where('m.sessionId = :sessionId', { sessionId })
       .groupBy('m.chatId')
       .orderBy('count', 'DESC')

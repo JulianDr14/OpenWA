@@ -2,8 +2,9 @@
  * Typed error hierarchy for the OpenWA SDK.
  *
  * The OpenWA API returns NestJS-default errors of the shape:
- *   `{ statusCode: number, message: string | string[], error: string }`
- * This module maps that to a typed, ergonomic error tree so callers can
+ *   `{ statusCode: number, message: string | string[], error?: string }`
+ * `error` is absent whenever the exception carried no explicit message, so it is never required to
+ * recognise the envelope. This module maps that to a typed, ergonomic error tree so callers can
  * `instanceof`-check or branch on `.status`.
  *
  * @packageDocumentation
@@ -75,10 +76,31 @@ export class OpenWAForbiddenError extends OpenWAApiError {}
 export class OpenWANotFoundError extends OpenWAApiError {}
 /** 409 Conflict — typically an {@link EngineNotReadyError} from the backend. */
 export class OpenWAConflictError extends OpenWAApiError {}
-/** 429 Too Many Requests — rate limited. */
+/**
+ * 429 Too Many Requests — rate limited. The global rate limiter's 429 lifts when its window
+ * expires (seconds for the per-second tier, up to an hour for the hourly tier by default); its
+ * delay is only in the `Retry-After` response header, which this error does not carry. A 429 whose
+ * `body` has `code: 'SEND_PACING_LIMITED'` is not transient: do not retry it before
+ * `body.retryAfterSeconds`, which can be hours.
+ */
 export class OpenWARateLimitError extends OpenWAApiError {}
 /** 501 Not Implemented — the active engine does not support this operation. */
 export class OpenWANotImplementedError extends OpenWAApiError {}
+
+/**
+ * 503 Service Unavailable — a transport failure, not a refusal. The gateway answers this when the
+ * engine did not confirm the operation in time: WhatsApp never replied, the socket was down, or the
+ * request budget ran out. **Retryable**, but a catalog 503 can persist because WhatsApp may never
+ * answer that query, so bound any retry.
+ *
+ * Not every 503 is safe to repeat blindly: the non-idempotent sends (group create, channel create,
+ * media send) are deliberately left unbounded by the gateway so a slow WhatsApp reply never answers
+ * one, and in a multi-node deployment a forwarded request answers 503 only when the owner node was
+ * never reached. A forward that fails after the request was sent answers 502 or 504 instead (a plain
+ * `OpenWAApiError`): the owner may already have carried it out, so do not repeat a non-idempotent
+ * send on those unchecked.
+ */
+export class OpenWAServiceUnavailableError extends OpenWAApiError {}
 
 /** Thrown when a request exceeds the configured timeout. */
 export class OpenWATimeoutError extends OpenWAError {
@@ -106,24 +128,36 @@ export function classifyApiError(status: number, message: string, body: unknown,
       return new OpenWARateLimitError(message, status, body, errorKind);
     case 501:
       return new OpenWANotImplementedError(message, status, body, errorKind);
+    case 503:
+      return new OpenWAServiceUnavailableError(message, status, body, errorKind);
     default:
       return new OpenWAApiError(message, status, body, errorKind);
   }
 }
 
-/** Narrow the NestJS error envelope shape: `{ statusCode, message, error }`. */
+/**
+ * Narrow the NestJS error envelope shape: `{ statusCode, message, error }`.
+ *
+ * `error` is optional. NestJS omits it whenever the exception was constructed without an explicit
+ * message — which is what the global ValidationPipe does under `disableErrorMessages`, the default
+ * when `NODE_ENV=production` and `VALIDATION_ERROR_DETAIL` is unset. Every rejected request in a
+ * stock production deployment therefore answers `{ statusCode, message }` and nothing else.
+ */
 interface NestErrorEnvelope {
   statusCode: number;
   message: string | string[];
-  error: string;
+  error?: string;
 }
 
 function isNestEnvelope(body: unknown): body is NestErrorEnvelope {
-  return typeof body === 'object' && body !== null && 'statusCode' in body && 'message' in body && 'error' in body;
+  return typeof body === 'object' && body !== null && 'statusCode' in body && 'message' in body;
 }
 
 function describeMessage(message: string | string[] | unknown): string {
   if (Array.isArray(message)) return message.join(', ');
   if (typeof message === 'string') return message;
+  // A body without the envelope, such as the readiness 503's `{ status, details }`. It came from
+  // JSON.parse, so it always stringifies.
+  if (typeof message === 'object' && message !== null) return JSON.stringify(message);
   return String(message);
 }

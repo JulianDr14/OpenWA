@@ -27,6 +27,7 @@ Each runbook follows this format:
 **Impact:** All sessions affected, messages not processing
 
 **Prerequisites:**
+
 - SSH access to server
 - Docker CLI access
 - Database access
@@ -37,8 +38,11 @@ Each runbook follows this format:
 # 1. Check container status
 docker compose ps
 
-# 2. Check container logs
-docker compose logs --tail=100 openwa
+# 2. Check container logs. Every `docker compose … openwa-api` below names the service as the
+#    production docker-compose.yml defines it — on docker-compose.dev.yml that service is called
+#    `openwa`, so substitute it there. The bare `docker stats`/`docker restart` forms take the
+#    container name, which is `openwa-api` under both files.
+docker compose logs --tail=100 openwa-api
 
 # 3. Check system resources
 docker stats --no-stream
@@ -47,18 +51,18 @@ free -m
 
 # 4. Identify root cause
 # A. Container crashed
-docker compose logs openwa 2>&1 | grep -i "error\|fatal\|crash"
+docker compose logs openwa-api 2>&1 | grep -i "error\|fatal\|crash"
 
 # B. Out of memory
-docker compose logs openwa 2>&1 | grep -i "oom\|memory"
+docker compose logs openwa-api 2>&1 | grep -i "oom\|memory"
 
 # C. Database connection
-docker compose logs openwa 2>&1 | grep -i "database\|connection refused"
+docker compose logs openwa-api 2>&1 | grep -i "database\|connection refused"
 
 # 5. Apply fix based on cause:
 
 # A. Simple restart
-docker compose restart openwa
+docker compose restart openwa-api
 
 # B. Full restart with cleanup
 docker compose down
@@ -68,11 +72,12 @@ docker compose up -d
 # Edit docker-compose.yml and increase memory limit
 docker compose up -d
 
-# D. Database issues
-docker compose restart postgres
+# D. Database issues (built-in PostgreSQL runs as container `openwa-postgres`, both when
+#    started via the compose `postgres`/`full` profile and when orchestrated by the app)
+docker restart openwa-postgres
 # Wait for postgres to be ready
 sleep 10
-docker compose restart openwa
+docker compose restart openwa-api
 ```
 
 **Verification:**
@@ -81,12 +86,13 @@ docker compose restart openwa
 # Check health
 curl http://localhost:2785/api/health
 
-# Check all sessions reconnected
+# Check all sessions reconnected (id alongside status — the send below needs the id)
 curl -H "X-API-Key: $API_KEY" \
-  http://localhost:2785/api/sessions | jq '.[].status'
+  http://localhost:2785/api/sessions | jq '.[] | {id, name, status}'
 
-# Send test message
-curl -X POST http://localhost:2785/api/sessions/default/messages/send-text \
+# Send test message ({sessionId} is the UUID from the listing above — session routes
+# resolve by id, not by session name)
+curl -X POST http://localhost:2785/api/sessions/{sessionId}/messages/send-text \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"chatId": "628xxx@c.us", "text": "Test after restart"}'
@@ -103,6 +109,7 @@ curl -X POST http://localhost:2785/api/sessions/default/messages/send-text \
 **Impact:** Single session affected
 
 **Prerequisites:**
+
 - API Key
 - Physical access to phone (if QR needed)
 
@@ -114,7 +121,7 @@ curl -H "X-API-Key: $API_KEY" \
   http://localhost:2785/api/sessions/{sessionId}
 
 # 2. Check if auto-reconnect is working
-docker compose logs openwa 2>&1 | grep -i "{sessionId}" | tail -20
+docker compose logs openwa-api 2>&1 | grep -i "{sessionId}" | tail -20
 
 # 3. Try session restart (stop then start — there is no /restart route)
 curl -X POST -H "X-API-Key: $API_KEY" \
@@ -167,14 +174,15 @@ curl -X POST http://localhost:2785/api/sessions/{sessionId}/messages/send-text \
 **Impact:** Performance degradation, potential OOM
 
 **Prerequisites:**
+
 - SSH access
 - Docker CLI
 
 **Steps:**
 
 ```bash
-# 1. Check current memory usage
-docker stats --no-stream openwa
+# 1. Check current memory usage (the container is named `openwa-api`)
+docker stats --no-stream openwa-api
 free -m
 
 # 2. Identify memory consumers
@@ -184,16 +192,16 @@ curl -H "Authorization: Bearer $METRICS_TOKEN" \
   | grep -E "openwa_process_resident_memory_bytes|openwa_process_heap_used_bytes"
 
 # 3. Check for memory leaks
-docker compose logs openwa 2>&1 | grep -i "heap\|memory\|gc"
+docker compose logs openwa-api 2>&1 | grep -i "heap\|memory\|gc"
 
 # 4. Immediate actions:
 
 # A. Clear the in-process cache (no runtime cache-clear API — restart the container;
 #    if using Redis, flush via redis-cli)
-docker compose restart openwa
+docker compose restart openwa-api
 
 # B. Restart container (will reconnect sessions)
-docker compose restart openwa
+docker compose restart openwa-api
 
 # C. If caused by too many sessions:
 # List sessions (no sort param); process memory is in stats/overview (memoryUsage, MB)
@@ -211,7 +219,7 @@ curl -H "X-API-Key: $API_KEY" \
 
 ```bash
 # Memory below threshold
-docker stats --no-stream openwa
+docker stats --no-stream openwa-api
 # Expected: Memory usage < 80%
 
 # All sessions still connected
@@ -232,6 +240,7 @@ as a delivery failure rather than retaining payloads without limit.
 **Impact:** External systems not receiving events
 
 **Prerequisites:**
+
 - API Key
 - Access to webhook endpoint
 
@@ -242,9 +251,17 @@ as a delivery failure rather than retaining payloads without limit.
 curl -H "X-API-Key: $API_KEY" \
   http://localhost:2785/api/sessions/{sessionId}/webhooks
 
-# 2. Check recent webhook deliveries
-# There is no webhook-delivery log API — inspect the server logs / audit trail instead:
-docker compose logs openwa 2>&1 | grep -i "webhook" | tail -20
+# 2. Check recent webhook deliveries — this admin-only endpoint lists abandoned deliveries
+#    most-recent-first: those that exhausted every retry, plus those never attempted at all
+#    (recorded with `attempts: 0` — payload over the cap or an unserializable payload
+#    (preflight), inline waiter-queue overflow, or rejection by the shutdown drain).
+#    A URL blocked by the SSRF guard never reaches delivery: it is rejected with a 400 when the
+#    webhook is registered, so it appears in no delivery-failure row.
+curl -H "X-API-Key: $API_KEY" \
+  "http://localhost:2785/api/webhooks/delivery-failures?sessionId={sessionId}&limit=20"
+
+# Attempts still in flight (not yet exhausted) only appear in the server logs:
+docker compose logs openwa-api 2>&1 | grep -i "webhook" | tail -20
 
 # 3. Identify failure reason:
 # A. Endpoint not responding
@@ -301,9 +318,9 @@ curl -X POST -H "X-API-Key: $API_KEY" \
   http://localhost:2785/api/sessions/{sessionId}/webhooks/{webhookId}/test
 # Expected: {"success": true, "statusCode": 200}
 
-# Recent deliveries successful
-# No delivery-log API — confirm via the server logs / audit trail:
-docker compose logs openwa 2>&1 | grep -i "webhook" | tail -5
+# No new permanent delivery failures for this session
+curl -H "X-API-Key: $API_KEY" \
+  "http://localhost:2785/api/webhooks/delivery-failures?sessionId={sessionId}&limit=5"
 ```
 
 ---
@@ -317,6 +334,7 @@ docker compose logs openwa 2>&1 | grep -i "webhook" | tail -5
 **Impact:** Service downtime during maintenance
 
 **Prerequisites:**
+
 - Scheduled maintenance window
 - Backup verified
 - User notification sent
@@ -331,11 +349,15 @@ docker stats --no-stream
 # 2. Notify users (via webhook or external system)
 # Send maintenance notification
 
-# 3. Create backup
-./scripts/backup.sh
+# 3. Create a backup in the running container, where the data is mounted, and copy it off the
+#    volume (see Runbook: Database Backup). A host run of ./scripts/backup.sh archives ./data in the
+#    checkout, which only a bare-metal install or docker-compose.dev.yml reads
+docker exec -e BACKUP_DIR=/app/data/backups -e TMPDIR=/app/data/backups openwa-api ./scripts/backup.sh
+docker cp openwa-api:/app/data/backups/. ./backups/
 
-# Verify backup
-ls -la /backups/openwa/$(date +%Y%m%d)/
+# Verify backup (backup.sh writes $BACKUP_DIR/openwa-backup-<timestamp>.tar.gz,
+# BACKUP_DIR defaults to ./backups — it creates no dated subdirectories)
+ls -la ./backups/openwa-backup-*.tar.gz
 
 # 4. Stop accepting new requests (if using load balancer)
 # Remove from load balancer or set to maintenance mode
@@ -391,6 +413,7 @@ curl -H "X-API-Key: $API_KEY" \
 **Impact:** Brief downtime during upgrade
 
 **Prerequisites:**
+
 - Backup completed
 - Release notes reviewed
 - Breaking changes identified
@@ -402,28 +425,41 @@ curl -H "X-API-Key: $API_KEY" \
 # 1. Review release notes
 # Check for breaking changes, migration requirements
 
-# 2. Create backup
-./scripts/backup.sh
-BACKUP_DIR="/backups/openwa/$(date +%Y%m%d-%H%M%S)"
+# 2. Create a backup in the running container, where the data is mounted, then copy it to
+#    $BACKUP_DIR as openwa-backup-<timestamp>.tar.gz, where the Rollback block reads it. Both compose
+#    files name the container openwa-api. Running ./scripts/backup.sh on the host instead archives
+#    ./data in the checkout, which the production compose never reads (see Runbook: Database Backup).
+#    An image older than 0.19.0 has no scripts/backup.sh, and on PostgreSQL one older than 0.22.0 has
+#    no pg_dump: see 14 - Known Upgrade Hazards
+export BACKUP_DIR="/backups/openwa"
+mkdir -p "$BACKUP_DIR"
+docker exec -e BACKUP_DIR=/app/data/backups -e TMPDIR=/app/data/backups openwa-api ./scripts/backup.sh
+docker cp openwa-api:/app/data/backups/. "$BACKUP_DIR"/
 
-# 3. Export current state
-docker compose exec openwa npm run export -- --output /tmp/export.json
-docker cp openwa:/tmp/export.json $BACKUP_DIR/
+# 3. Export the Data DB as JSON alongside the archive (admin key)
+curl -H "X-API-Key: $API_KEY" \
+  http://localhost:2785/api/infra/export-data > "$BACKUP_DIR/export-data.json"
+
+# Started with docker-compose.dev.yml (the README Quick Start)? Add `-f docker-compose.dev.yml`
+# to every docker compose command in this runbook, the Rollback block included, and write `openwa`
+# wherever a command names the `openwa-api` service (steps 6 and 7, rollback steps 2 and 3).
 
 # 4. Stop services
 docker compose down
 
-# 5. Update version in docker-compose.yml
-# Change: image: ghcr.io/rmyndharis/openwa:0.1.0
-# To:     image: ghcr.io/rmyndharis/openwa:0.7.3
+# 5. Fetch the new release
+# The shipped docker-compose.yml BUILDS openwa-api from source (`build: context: .`) — there is
+# no `image:` tag to edit and `docker compose pull` never updates the app, so upgrade the source:
+git pull
+# or pin to a release: git checkout v<new-version>
 
-# 6. Pull new image
-docker compose pull
+# 6. Build the new image
+docker compose build openwa-api
 
 # 7. Run database migrations (if any)
 # Use migration:run:prod in the production image — `migration:run` needs ts-node + the TS
 # source, both stripped from the prod image by `npm ci --omit=dev`.
-docker compose run --rm openwa npm run migration:run:prod
+docker compose run --rm openwa-api npm run migration:run:prod
 
 # 8. Start services
 docker compose up -d
@@ -432,27 +468,42 @@ docker compose up -d
 sleep 30
 curl http://localhost:2785/api/health
 
-# 10. Verify version
-curl http://localhost:2785/api/health | jq '.version'
+# 10. Verify version (`version` is only included for an authenticated request)
+curl -H "X-API-Key: $API_KEY" http://localhost:2785/api/health | jq '.version'
 
 # 11. Verify all sessions
 curl -H "X-API-Key: $API_KEY" \
   http://localhost:2785/api/sessions
 
-# 12. Test critical flows
-./scripts/smoke-test.sh
+# 12. Test critical flows — send through a live session ({sessionId} from step 11)
+curl -X POST http://localhost:2785/api/sessions/{sessionId}/messages/send-text \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"chatId": "628xxx@c.us", "text": "Post-upgrade check"}'
 ```
+
+> If you deploy the published image instead of building from source — your own compose file with
+> `image: ghcr.io/rmyndharis/openwa:<tag>` — replace steps 5-6 with editing that tag and running
+> `docker compose pull`.
+
+> On Kubernetes with the chart in `charts/openwa`, take the step 2 backup with the Helm lines in
+> Runbook: Database Backup and the step 3 export first, then replace steps 4-8 with checking out the
+> new release and running `helm upgrade openwa ./charts/openwa --reuse-values`. The image tag defaults
+> to the chart's `appVersion`, so the checkout moves it, unless `image.tag` was set at install:
+> `--reuse-values` keeps that value, so pass `--set image.tag=<new-version>` in that case.
+> Run steps 9-12 through `kubectl port-forward` to the release's Service. `helm rollback` keeps the
+> volume, so read the notes on restoring `sessions/` below before relying on it.
 
 **Verification:**
 
 ```bash
-# Correct version
-curl http://localhost:2785/api/health | jq '.version'
-# Expected: "0.7.3"
+# Correct version (`version` is only included for an authenticated request)
+curl -H "X-API-Key: $API_KEY" http://localhost:2785/api/health | jq '.version'
+# Expected: "<new-version>"
 
-# All tests pass
-./scripts/smoke-test.sh
-# Expected: All tests pass
+# All sessions reconnected
+curl -H "X-API-Key: $API_KEY" \
+  http://localhost:2785/api/sessions | jq '.[].status'
 ```
 
 **Rollback:**
@@ -461,10 +512,45 @@ curl http://localhost:2785/api/health | jq '.version'
 # 1. Stop services
 docker compose down
 
-# 2. Revert docker-compose.yml to previous version
+# 2. Restore from the pre-upgrade backup (main.sqlite, a SQLite data store and the auth state). The
+#    archive upgrade step 2 produced is
+#    "$BACKUP_DIR/openwa-backup-<timestamp>.tar.gz". The databases in place still hold the failed
+#    upgrade's data, so the restore refuses to touch them without --force. That state is not lost: it
+#    is kept in "$BACKUP_DIR/data.pre-restore-<ts>", the path the script prints. It runs in the image
+#    because the data lives in the openwa-data volume (see Runbook: Restore from Backup), and before
+#    the checkout below because an image older than 0.23.7 cannot move its safety snapshot off the
+#    read-only container root
+docker compose run --rm --no-deps --entrypoint /app/scripts/restore.sh \
+  -v "$BACKUP_DIR:/backups" -e OPENWA_RESTORE_SNAPSHOT_DIR=/backups -e TMPDIR=/backups -e HOME=/tmp \
+  openwa-api /backups/openwa-backup-<timestamp>.tar.gz --force
 
-# 3. Restore from the pre-upgrade backup (both DBs + sessions)
-./scripts/restore.sh "$BACKUP_FILE"
+# On a PostgreSQL data store, step 2 leaves the upgraded database in place. Load the pre-upgrade dump
+# into an empty database: replayed over the upgraded tables, its CREATE statements fail and its rows
+# mix with theirs. With the built-in PostgreSQL (the compose `postgres` service, or the
+# openwa-postgres container Dashboard > Infrastructure created), start only the database; openwa-api
+# stays stopped, or the rename below fails on its open connections. The upgraded database is kept
+# under a new name, as the SQLite path keeps data.pre-restore-<ts>, and an empty one takes its place.
+# The container's own POSTGRES_USER and POSTGRES_DB name the role and database the app uses. The
+# image's pg_dump 17 writes `SET transaction_timeout = 0;`, which PostgreSQL 16 rejects, so sed
+# drops that line before psql
+docker compose --profile postgres up -d postgres   # dashboard-created: docker start openwa-postgres
+docker exec openwa-postgres sh -c 'until pg_isready -q -U "$POSTGRES_USER"; do sleep 1; done'
+docker exec openwa-postgres sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres \
+  -c "ALTER DATABASE \"$POSTGRES_DB\" RENAME TO \"${POSTGRES_DB}_pre_restore_$(date +%Y%m%d%H%M%S)\"" \
+  -c "CREATE DATABASE \"$POSTGRES_DB\" OWNER \"$POSTGRES_USER\""'
+tar -xzOf "$BACKUP_DIR/openwa-backup-<timestamp>.tar.gz" ./database.sql | sed '/^SET transaction_timeout = 0;$/d' |
+  docker exec -i openwa-postgres sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+
+# An external PostgreSQL server: rename the upgraded database and create an empty one under the
+# DATABASE_NAME the app uses in the same way, then load the dump into it. DATABASE_URL is not an
+# OpenWA setting: fill in your own URL for that database, such as
+# postgres://<user>@<host>:5432/<database>, with the password in PGPASSWORD
+tar -xzOf "$BACKUP_DIR/openwa-backup-<timestamp>.tar.gz" ./database.sql | sed '/^SET transaction_timeout = 0;$/d' |
+  psql -v ON_ERROR_STOP=1 "$DATABASE_URL"
+
+# 3. Check out the previous release and rebuild the image
+git checkout v<old-version>
+docker compose build openwa-api
 
 # 4. Start with old version
 docker compose up -d
@@ -472,6 +558,25 @@ docker compose up -d
 # 5. Verify rollback (note: readiness is at /api/health/ready)
 curl -H "X-API-Key: $API_KEY" http://localhost:2785/api/health
 ```
+
+> Restoring `sessions/` is required, not optional, when the rollback crosses a browser major upgrade (on
+> amd64, 0.23.5 moved Chrome for Testing from 146 to 153; arm64 runs the chromium Debian shipped when each
+> image was built), and the backup must predate the first start on the newer image; a daily backup taken
+> after the upgrade does not qualify. An older Chrome silently deletes the IndexedDB of a profile a newer
+> Chrome has opened, which is where whatsapp-web.js keeps the WhatsApp login. The symptom: every
+> previously linked whatsapp-web.js session starts at a QR code instead of reconnecting, the log names no
+> cause (0.23.3 and 0.23.4 log only a generic `relink_required` warning), and upgrading again does not
+> bring the pairing back. Changing only the image tag, or `helm rollback` (which keeps the volume), skips
+> the restore and hits this. A session first paired on the newer image is not in that backup and must be
+> paired again either way. Baileys sessions are unaffected.
+
+> Restoring `sessions/` **and** `baileys/` is likewise required when rolling back past 0.23.5, on either
+> engine and either architecture. 0.23.5 renames each session's auth directory from the session name to
+> its UUID id at first boot (`session-<id>` under `SESSION_DATA_PATH`, `<id>` under `BAILEYS_AUTH_DIR`);
+> an older image looks for the name-keyed directory, finds nothing, and starts every session at a QR
+> code. The rename keeps nothing behind to fall back to, so the backup must again predate the first
+> start on 0.23.5. Restoring both directories from that backup returns every session to its previous
+> pairing.
 
 ---
 
@@ -482,6 +587,7 @@ curl -H "X-API-Key: $API_KEY" http://localhost:2785/api/health
 **Impact:** None (online backup)
 
 **Prerequisites:**
+
 - Sufficient disk space
 - Backup storage accessible
 
@@ -493,30 +599,73 @@ User-managed files outside that list (for example the project-level `.env`) must
 
 ```bash
 # scripts/backup.sh captures:
-#   - main.sqlite   — auth (API keys) + audit log   (ALWAYS SQLite)
-#   - openwa.sqlite — user data                      (or a pg_dump when DATABASE_TYPE=postgres)
+#   - main.sqlite   — auth (API keys) + audit log   (ALWAYS SQLite; MAIN_DATABASE_NAME, default ./data/main.sqlite)
+#   - openwa.sqlite — user data                      (DATABASE_NAME, default ./data/openwa.sqlite;
+#                                                     or a pg_dump when DATABASE_TYPE=postgres)
 #   - sessions/     — whatsapp-web.js state (SESSION_DATA_PATH)
 #   - baileys/      — Baileys credentials (BAILEYS_AUTH_DIR)
-#   - media/        — local media                    (skipped automatically when STORAGE_TYPE=s3)
+#   - media/        — local media                    (STORAGE_LOCAL_PATH, archived whenever present; with
+#                                                     STORAGE_TYPE=s3 it holds only files the app could not
+#                                                     write to the bucket, so back up the bucket separately)
 #   - plugin-packages/ — installed plugin code from PLUGINS_DIR
-#   - plugin-state/    — registry + ctx.storage state under OPENWA_DATA_DIR
+#                        (not packages in a legacy ./plugins, which the app still loads while
+#                        PLUGINS_DIR is unset; backup.sh warns about those)
+#   - plugin-state/    — registry + ctx.storage state under PLUGIN_STATE_DIR/plugins
+#                        (default: <OPENWA_DATA_DIR>/plugins)
 #   - .env.generated / .api-key — generated configuration and bootstrap secret
+#                                  (.api-key from BOOTSTRAP_KEY_FILE when that is set)
+#
+# The database paths resolve exactly like the app: MAIN_DATABASE_NAME / DATABASE_NAME from the
+# environment, then ./.env, then <data dir>/.env.generated, otherwise the fixed ./data defaults; they
+# are NOT derived from OPENWA_DATA_DIR. A missing source database fails the run (no silent empty
+# backup), the finished archive is checked to contain every configured database, and with the sqlite3
+# CLI present the databases are snapshotted online via .backup (otherwise plain-copied with a
+# CONSISTENCY-WARNING marker inside the archive).
 
-# Run from the repo root (operates on the data dir, default ./data):
+# Run from the repo root (database defaults are ./data/...; state dirs follow OPENWA_DATA_DIR):
 ./scripts/backup.sh
 
-# Customize via environment:
+# Customize via environment. Keep the password out of DATABASE_URL: the URL is passed to pg_dump as
+# an argument, which every local user can read in the process list while the dump runs. pg_dump
+# takes it from PGPASSWORD (or ~/.pgpass) instead:
 OPENWA_DATA_DIR=/srv/openwa/data \
   BACKUP_DIR=/backups/openwa \
-  DATABASE_TYPE=postgres DATABASE_URL=postgres://user:pass@host:5432/openwa \
+  DATABASE_TYPE=postgres DATABASE_URL=postgres://user@host:5432/openwa PGPASSWORD='<password>' \
   ./scripts/backup.sh
 ```
 
 > The data directory is a Docker **named volume** (`openwa-data`) in the production
 > compose. Run the script where that volume is mounted — e.g. point `OPENWA_DATA_DIR`
-> at the volume's mountpoint, or run it inside a container with `/app/data` mounted. When operating
-> directly on the host mount, also set any path that does not use its default below `OPENWA_DATA_DIR`
-> (notably compose's colocated `PLUGINS_DIR`) to the corresponding host-visible path.
+> at the volume's mountpoint, or run it inside a container with `/app/data` mounted.
+>
+> The shipped compose file and Helm chart mount the container root read-only, so the default
+> `./backups` (`/app/backups`) cannot be created there and the script refuses to start. Inside the
+> container, write to the data volume and then copy the archive off it, since an archive on the same
+> volume as the data does not survive losing that volume:
+>
+> ```bash
+> docker exec -e BACKUP_DIR=/app/data/backups -e TMPDIR=/app/data/backups openwa-api ./scripts/backup.sh
+> docker cp openwa-api:/app/data/backups/. ./backups/
+> # Helm: kubectl exec <pod> -- env BACKUP_DIR=/app/data/backups ./scripts/backup.sh
+> #       kubectl cp <pod>:/app/data/backups ./backups
+> ```
+>
+> The script stages a full copy of the data in `TMPDIR` before archiving it. The compose file mounts
+> `/tmp` as a tmpfs charged to the container's memory limit, so the compose line points `TMPDIR` at
+> the data volume, which then needs free space for about the size of the data plus the archive;
+> staging in the tmpfs gets the running gateway OOM-killed. The Helm chart's `/tmp` is an `emptyDir`
+> on node disk, so the Helm lines leave it alone. A run killed outright, such as by a container
+> restart mid-backup, leaves its `tmp.*` staging directory behind in `TMPDIR`; delete it.
+>
+> The scripts resolve every other path the way the application does: an explicit environment value
+> first, then `./.env`, then `<data dir>/.env.generated`. Settings made through Dashboard >
+> Infrastructure therefore apply without being restated on the command line. A restore reads that
+> third layer from the archive's `.env.generated` when the archive carries one, because that copy
+> replaces the target's and is the one the restored app reads. Two caveats when
+> operating directly on the host mount: a path recorded inside the container (`/app/data/...`) is not
+> host-visible, so override it in the environment; and a value written with quotes or a trailing `#`
+> comment, or a `KEY: value` line, is reported and skipped rather than guessed at, so pass those
+> explicitly too. Blanks around `=` and CRLF line endings are read as the app reads them.
 
 **Verification:**
 
@@ -538,6 +687,7 @@ tar -tzf ./backups/openwa-backup-*.tar.gz
 **Impact:** Service downtime during restore
 
 **Prerequisites:**
+
 - Valid backup file
 - Sufficient disk space
 - SSH access
@@ -554,16 +704,111 @@ the current data dir first so a bad restore can be undone:
 docker compose down
 
 # 2. Restore from an archive produced by scripts/backup.sh
-#    (operates on the data dir, default ./data; override with OPENWA_DATA_DIR)
+#    (databases land on MAIN_DATABASE_NAME / DATABASE_NAME, default ./data/... — the same paths
+#    the app reads, as the environment, ./.env or the archive's .env.generated set them; non-DB
+#    state follows OPENWA_DATA_DIR. Pass --strict to refuse an archive
+#    whose CONSISTENCY-WARNING marker reports plain-copied, possibly-torn database snapshots.
+#    Restoring over an existing install's live databases requires --force; without it the script
+#    refuses to overwrite them)
 ./scripts/restore.sh ./backups/openwa-backup-<timestamp>.tar.gz
 
-# 3. (Postgres only) the archive contains database.sql — import it manually:
-#    psql "$DATABASE_URL" < ./data/database.sql
+# 3. (Postgres only) the archive contains database.sql. Load it into an empty database: its CREATE
+#    statements fail against tables that already exist. With the built-in PostgreSQL (the compose
+#    `postgres` service, or the openwa-postgres container Dashboard > Infrastructure created), start
+#    only the database; the app stays stopped, or the rename below fails on its open connections.
+#    The current database is kept under a new name, as the data dir is kept in data.pre-restore-<ts>,
+#    and an empty one takes its place. The container's own POSTGRES_USER and POSTGRES_DB name the
+#    role and database the app uses. The image's pg_dump 17 writes `SET transaction_timeout = 0;`,
+#    which PostgreSQL 16 rejects, so sed drops that line before psql
+docker compose --profile postgres up -d postgres   # dashboard-created: docker start openwa-postgres
+docker exec openwa-postgres sh -c 'until pg_isready -q -U "$POSTGRES_USER"; do sleep 1; done'
+docker exec openwa-postgres sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres \
+  -c "ALTER DATABASE \"$POSTGRES_DB\" RENAME TO \"${POSTGRES_DB}_pre_restore_$(date +%Y%m%d%H%M%S)\"" \
+  -c "CREATE DATABASE \"$POSTGRES_DB\" OWNER \"$POSTGRES_USER\""'
+tar -xzOf ./backups/openwa-backup-<timestamp>.tar.gz ./database.sql | sed '/^SET transaction_timeout = 0;$/d' |
+  docker exec -i openwa-postgres sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+
+#    An external PostgreSQL server: rename the current database and create an empty one under the
+#    DATABASE_NAME the app uses in the same way, then load the dump into it. DATABASE_URL is not an
+#    OpenWA setting: fill in your own URL for that database, such as
+#    postgres://<user>@<host>:5432/<database>, with the password in PGPASSWORD
+tar -xzOf ./backups/openwa-backup-<timestamp>.tar.gz ./database.sql | sed '/^SET transaction_timeout = 0;$/d' |
+  psql -v ON_ERROR_STOP=1 "$DATABASE_URL"
 
 # 4. Start the app and CONFIRM an existing API key still authenticates
 docker compose up -d
 curl -s -X POST -H "X-API-Key: <an-existing-key>" http://localhost:2785/api/auth/validate
 ```
+
+> Step 2 as written restores into `./data` in the checkout. The app reads that directory only on a
+> bare-metal install or under `docker-compose.dev.yml`, which bind-mounts it. The production compose
+> file keeps the data in the **named volume** `openwa-data` and the Helm chart in a PVC, so a host run
+> there fills a directory the container never reads and still reports success. Run the script from the
+> image against the volume instead, in place of step 2. Both mount the container root read-only, so
+> `OPENWA_RESTORE_SNAPSHOT_DIR` (0.23.7 or later) puts the pre-restore snapshots, of the data dir and of
+> any state directory mounted outside it, on a writable, persistent path, and `TMPDIR` keeps the
+> extracted archive there too; allow free space for about twice the data plus the archive. `--force` is
+> included because the volume of an existing install still holds its databases:
+>
+> ```bash
+> # Compose: the entrypoint override runs the script as root, which can read the archive and write
+> # the volume; the next start hands the restored files back to the app user. The image sets
+> # HOME=/app/data, and the script refuses a data dir that is the home directory, so HOME is moved
+> # off it here for a compose file that does not already set it.
+> docker compose run --rm --no-deps --entrypoint /app/scripts/restore.sh \
+>   -v "$PWD/backups:/backups" -e OPENWA_RESTORE_SNAPSHOT_DIR=/backups -e TMPDIR=/backups -e HOME=/tmp \
+>   openwa-api /backups/openwa-backup-<timestamp>.tar.gz --force
+>
+> # Helm, for a release named openwa (`kubectl get statefulset,configmap,pvc` shows the names of
+> # another): stop the pod, then run the script in a helper pod on the same PVC, with the release's image.
+> kubectl scale statefulset/openwa --replicas=0
+> kubectl wait --for=delete pod/openwa-0 --timeout=120s
+> kubectl apply -f - <<'EOF'
+> apiVersion: v1
+> kind: Pod
+> metadata:
+>   name: openwa-restore
+> spec:
+>   restartPolicy: Never
+>   containers:
+>     - name: restore
+>       image: ghcr.io/rmyndharis/openwa:<version>
+>       command: ['sleep', 'infinity']
+>       envFrom:
+>         - configMapRef:
+>             name: openwa
+>       volumeMounts:
+>         - { name: data, mountPath: /app/data }
+>         - { name: work, mountPath: /restore }
+>   volumes:
+>     - name: data
+>       persistentVolumeClaim:
+>         claimName: data-openwa-0
+>     - name: work
+>       emptyDir: {}
+> EOF
+> kubectl wait --for=condition=Ready pod/openwa-restore --timeout=300s
+> kubectl cp ./backups/openwa-backup-<timestamp>.tar.gz openwa-restore:/restore/backup.tar.gz
+> # HOME is moved off the data dir here too, as in the compose command.
+> kubectl exec openwa-restore -- env HOME=/tmp OPENWA_RESTORE_SNAPSHOT_DIR=/restore TMPDIR=/restore \
+>   ./scripts/restore.sh /restore/backup.tar.gz --force
+> # The emptyDir goes away with the pod: copy off every snapshot the script named first.
+> kubectl cp openwa-restore:/restore/data.pre-restore-<ts> ./backups/data.pre-restore-<ts>
+> kubectl delete pod openwa-restore
+> kubectl scale statefulset/openwa --replicas=1
+> ```
+>
+> The PostgreSQL import in step 3 reads the dump from the archive, not from `./data` on the host, so
+> it works unchanged after either command. The Helm chart ships no PostgreSQL, so on Helm use the
+> external-server form of step 3 against the database the release's `DATABASE_*` settings name.
+> On Helm, run the step 4 check through `kubectl port-forward` to the release's Service.
+
+> **PostgreSQL restores are read as UTC.** From 0.23.6 the data connection binds, parses and defaults
+> every timestamp in UTC, and refuses to boot when its session is not on UTC
+> ([05 - Database Design](./05-database-design.md#timestamps-on-postgresql-are-utc)). A `database.sql`
+> taken from a gateway that ran off UTC before 0.23.6 holds that host's local wall time in the columns
+> the app wrote, so those rows read as shifted by the offset once restored. The 0.23.6 upgrade notes in
+> `CHANGELOG.md` carry the conversion and name the columns it must not touch.
 
 > `main.sqlite` carries the hashed API keys and audit log; `.api-key`, when retained by the original
 > installation, carries the plaintext bootstrap admin key. After restore, verify that both expected files
@@ -581,9 +826,10 @@ curl http://localhost:2785/api/health
 curl -H "X-API-Key: $API_KEY" \
   http://localhost:2785/api/sessions
 
-# Verify data integrity
+# Verify data integrity ({sessionId} is the UUID from the listing above — session routes
+# resolve by id, not by session name)
 curl -H "X-API-Key: $API_KEY" \
-  "http://localhost:2785/api/sessions/default/messages?limit=1"
+  "http://localhost:2785/api/sessions/{sessionId}/messages?limit=1"
 ```
 
 ---
@@ -592,14 +838,14 @@ curl -H "X-API-Key: $API_KEY" \
 
 ### Alert Response Matrix
 
-| Alert | Severity | Response Time | Runbook |
-|-------|----------|---------------|---------|
-| Service Down | Critical | 5 min | Service Down |
-| High Memory | Warning | 30 min | High Memory Usage |
-| Session Disconnected | Warning | 15 min | Session Disconnected |
-| Webhook Failures > 5% | Warning | 30 min | Webhook Delivery Failure |
-| Disk Space < 10% | Critical | 15 min | Disk Space Low |
-| Certificate Expiry < 7 days | Warning | 24 hours | Certificate Renewal |
+| Alert                       | Severity | Response Time | Runbook                  |
+| --------------------------- | -------- | ------------- | ------------------------ |
+| Service Down                | Critical | 5 min         | Service Down             |
+| High Memory                 | Warning  | 30 min        | High Memory Usage        |
+| Session Disconnected        | Warning  | 15 min        | Session Disconnected     |
+| Webhook Failures > 5%       | Warning  | 30 min        | Webhook Delivery Failure |
+| Disk Space < 10%            | Critical | 15 min        | Disk Space Low           |
+| Certificate Expiry < 7 days | Warning  | 24 hours      | Certificate Renewal      |
 
 ### Runbook: Certificate Renewal
 
@@ -642,7 +888,9 @@ df -h
 # 2. Find large files
 du -sh /var/lib/docker/*
 du -sh ./data/*
-du -sh ./logs/*
+# The app writes no log files — it logs to stdout, so log volume is whatever the Docker
+# log driver retains for the container:
+du -sh "$(docker inspect --format='{{.LogPath}}' openwa-api)"
 
 # 3. Clean up:
 
@@ -650,8 +898,9 @@ du -sh ./logs/*
 docker system prune -af
 docker volume prune -f
 
-# B. Old logs
-find ./logs -name "*.log" -mtime +7 -delete
+# B. Container log (Docker-managed; cap it at the daemon/compose log-driver level to stop it
+#    growing back)
+sudo truncate -s 0 "$(docker inspect --format='{{.LogPath}}' openwa-api)"
 
 # C. Old backups
 find /backups -name "*.tar.gz" -mtime +30 -delete
@@ -659,9 +908,6 @@ find /backups -name "*.tar.gz" -mtime +30 -delete
 # D. Message attachments (if backed up)
 # Warning: This deletes media files
 find ./data/media -mtime +30 -delete
-
-# E. Truncate large log files
-truncate -s 0 ./logs/openwa.log
 
 # 4. Verify
 df -h
@@ -729,6 +975,7 @@ External Contacts:
 - Domain registrar: [support email]
 - SSL provider: [support portal]
 ```
+
 ---
 
 <div align="center">

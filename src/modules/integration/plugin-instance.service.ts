@@ -5,6 +5,9 @@ import { Repository } from 'typeorm';
 import { PluginInstance } from './entities/plugin-instance.entity';
 import type { PluginConfigSchema } from '../../core/plugins/plugin.interfaces';
 import { redactSecretConfig, restoreSecretConfig, SECRET_SENTINEL } from '../plugins/redact-config';
+// Type-only: the module binds this class to PLUGIN_INSTANCE_PORT with a `useExisting` alias, which
+// TypeScript does not check, so `implements` is what keeps the two in step.
+import type { PluginInstancePort } from '../../core/plugins/plugin-host-ports';
 
 // A supplied ingress secret must be a real, guessing-resistant value; an empty/short one would make the
 // public HMAC forgeable. Absent => auto-generate. Trimmed so pasted whitespace can't slip a weak secret in.
@@ -25,7 +28,7 @@ export class InstanceExistsError extends Error {
 }
 
 @Injectable()
-export class PluginInstanceService {
+export class PluginInstanceService implements PluginInstancePort {
   constructor(@InjectRepository(PluginInstance, 'data') private readonly repo: Repository<PluginInstance>) {}
 
   async mint(
@@ -42,7 +45,7 @@ export class PluginInstanceService {
       instanceId,
       sessionScope: opts.sessionScope || null,
       secret: normalizeSecret(opts.secret),
-      verifyToken: opts.verifyToken ?? null,
+      verifyToken: opts.verifyToken || randomBytes(16).toString('hex'),
       config: opts.config ?? null,
       enabled: true,
     });
@@ -77,7 +80,7 @@ export class PluginInstanceService {
       instanceId,
       sessionScope: opts.sessionScope || null,
       secret: normalizeSecret(opts.secret),
-      verifyToken: opts.verifyToken ?? null,
+      verifyToken: opts.verifyToken || randomBytes(16).toString('hex'),
       config: opts.config ?? null,
       enabled: true,
     });
@@ -100,21 +103,15 @@ export class PluginInstanceService {
     return this.repo.save(inst);
   }
 
-  async setEnabled(pluginId: string, instanceId: string, enabled: boolean): Promise<PluginInstance | null> {
-    const inst = await this.resolve(pluginId, instanceId);
-    if (!inst) return null;
-    inst.enabled = enabled;
-    return this.repo.save(inst);
-  }
-
   async update(
     pluginId: string,
     instanceId: string,
-    patch: { sessionScope?: string; config?: Record<string, unknown> },
+    patch: { enabled?: boolean; sessionScope?: string | null; config?: Record<string, unknown> },
     schema?: PluginConfigSchema,
   ): Promise<PluginInstance | null> {
     const inst = await this.resolve(pluginId, instanceId);
     if (!inst) return null;
+    if (patch.enabled !== undefined) inst.enabled = patch.enabled;
     if (patch.sessionScope !== undefined) inst.sessionScope = patch.sessionScope || null;
     if (patch.config !== undefined) {
       // The operator view masks secrets as the sentinel, so a round-tripped config carries '***' for

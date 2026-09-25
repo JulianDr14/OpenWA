@@ -4,15 +4,18 @@ import { Download, Search, Filter, Loader2, FileText, AlertCircle } from 'lucide
 import type { AuditLog } from '../services/api';
 import { auditApi } from '../services/api';
 import { useDocumentTitle } from '../hooks/useDocumentTitle';
+import { useToast } from '../hooks/useToast';
 import { useLogsQuery } from '../hooks/queries';
 import { PageHeader } from '../components/PageHeader';
 import { CustomSelect } from '../components/CustomSelect';
 import { pageWindow } from '../utils/pageWindow';
 import { fetchAllPages } from '../utils/fetchAllPages';
+import { escapeCsvCell } from '../utils/csv';
 import './Logs.css';
 
 export function Logs() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const toast = useToast();
   useDocumentTitle(t('logs.title'));
   const [searchQuery, setSearchQuery] = useState('');
   const [severityFilter, setSeverityFilter] = useState('all');
@@ -33,6 +36,13 @@ export function Logs() {
   });
 
   const totalPages = Math.ceil(total / limit);
+  // Distinguish "filters matched nothing on this page" from "there are no logs at all": the search
+  // box only filters the fetched page (the API has no text search), so a non-match here must not
+  // read as "no such event exists" while more pages may hold it.
+  const hasSearch = searchQuery.trim() !== '';
+  // Severity is enforced SERVER-SIDE (the query carries it): an empty result there means no logs
+  // match at all, which deserves different guidance than the page-local search box.
+  const hasSeverityFilter = severityFilter !== 'all';
 
   const formatTimestamp = (date: string) => new Date(date).toLocaleString();
 
@@ -49,10 +59,6 @@ export function Logs() {
       'statusCode',
       'errorMessage',
     ];
-    const escape = (value: unknown): string => {
-      const s = value === undefined || value === null ? '' : String(value);
-      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-    };
     const lines = rows.map(log =>
       [
         log.createdAt,
@@ -66,7 +72,7 @@ export function Logs() {
         log.statusCode,
         log.errorMessage,
       ]
-        .map(escape)
+        .map(escapeCsvCell)
         .join(','),
     );
     return [headers.join(','), ...lines].join('\n');
@@ -84,21 +90,38 @@ export function Logs() {
 
   // Export the WHOLE audit history (honouring the active severity filter + search), not just the
   // current page — paginate through the API up to a safety cap so a huge table can't OOM the tab. On
-  // a fetch error, fall back to exporting the rows already on screen.
+  // a fetch error, report it and download nothing: the rows on screen would pass for the full export.
   const handleExportCsv = async () => {
     if (exporting) return;
     setExporting(true);
     try {
-      const all = await fetchAllPages<AuditLog>((limit, offset) =>
+      const { items, truncated, throttled } = await fetchAllPages<AuditLog>((limit, offset) =>
         auditApi.list({ severity: severityParam, limit, offset }),
       );
+      // The walk pages by offset over a live table, newest first: a row written between two pages pushes
+      // the older ones down, so the next page starts with one already fetched. Keep each id once.
+      const all = [...new Map(items.map(log => [log.id, log])).values()];
       const q = searchQuery.toLowerCase();
       const rows = q
         ? all.filter(l => l.action.toLowerCase().includes(q) || (l.errorMessage || '').toLowerCase().includes(q))
         : all;
-      if (rows.length > 0) download(buildCsv(rows));
-    } catch {
-      if (filteredLogs.length > 0) download(buildCsv(filteredLogs)); // graceful fallback to the page
+      // Either stop keeps the newest rows (the API orders newest first); older ones are missing. A
+      // narrower filter gets past the cap, only waiting gets past the throttle. The count follows the UI
+      // language, not the browser's locale, so it reads right inside the sentence.
+      const rowCount = all.length.toLocaleString(i18n.resolvedLanguage);
+      if (rows.length === 0) {
+        // After a truncated walk the older rows were never searched, so the message must not read as
+        // a verdict on the whole history.
+        if (truncated) toast.warning(t('logs.exportNoMatchesTruncated', { rows: rowCount }));
+        else toast.info(t('logs.exportNoMatches'));
+        return;
+      }
+      download(buildCsv(rows));
+      if (truncated) {
+        toast.warning(t(throttled ? 'logs.exportThrottled' : 'logs.exportTruncated', { rows: rowCount }));
+      }
+    } catch (err) {
+      toast.error(t('logs.exportFailed'), err instanceof Error ? err.message : undefined);
     } finally {
       setExporting(false);
     }
@@ -142,7 +165,11 @@ export function Logs() {
             type="text"
             placeholder={t('logs.searchPlaceholder')}
             value={searchQuery}
-            onChange={e => setSearchQuery(e.target.value)}
+            onChange={e => {
+              setSearchQuery(e.target.value);
+              // A new query invalidates the current page position, like the severity filter below.
+              setPage(1);
+            }}
           />
         </div>
 
@@ -177,8 +204,21 @@ export function Logs() {
           {filteredLogs.length === 0 ? (
             <div className="empty-table-state">
               <FileText size={48} strokeWidth={1} />
-              <h3>{t('logs.empty.title')}</h3>
-              <p>{t('logs.empty.description')}</p>
+              {hasSeverityFilter || hasSearch ? (
+                <>
+                  <h3>{t('logs.empty.filteredTitle')}</h3>
+                  <p>
+                    {hasSeverityFilter && !hasSearch
+                      ? t('logs.empty.filteredServerDescription')
+                      : t('logs.empty.filteredDescription')}
+                  </p>
+                </>
+              ) : (
+                <>
+                  <h3>{t('logs.empty.title')}</h3>
+                  <p>{t('logs.empty.description')}</p>
+                </>
+              )}
             </div>
           ) : (
             filteredLogs.map(log => (

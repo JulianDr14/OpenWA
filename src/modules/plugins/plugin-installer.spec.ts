@@ -94,6 +94,24 @@ describe('parsePluginPackage', () => {
     expect(() => parsePluginPackage(zipOf({ 'index.js': 'x' }))).toThrow(/no manifest/i);
   });
 
+  it('rejects bytes that are not a zip at all with a 400', () => {
+    expect(() => parsePluginPackage(Buffer.from('not a zip at all'))).toThrow(BadRequestException);
+  });
+
+  it('rejects an archive whose trailer parses but whose directory does not, with a 400', () => {
+    // adm-zip's constructor reads only the end-of-central-directory record; the central directory
+    // is parsed lazily by getEntries(). An archive corrupted between the two throws out of
+    // getEntries ('Invalid CEN header'), which used to escape as a plain Error and reach the
+    // caller as a 500 for what is an unreadable upload.
+    const good = zipOf({ 'manifest.json': JSON.stringify(validManifest), 'index.js': 'x' });
+    const bad = Buffer.from(good);
+    const eocd = bad.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+    bad.writeUInt32LE(0xdeadbeef, bad.readUInt32LE(eocd + 16)); // clobber the first CEN signature
+
+    expect(() => parsePluginPackage(bad)).toThrow(BadRequestException);
+    expect(() => parsePluginPackage(bad)).toThrow(/not a valid \.zip archive/i);
+  });
+
   it('rejects a manifest missing a required field', () => {
     const bad = { ...validManifest, main: undefined };
     expect(() => parsePluginPackage(zipOf({ 'manifest.json': JSON.stringify(bad), 'index.js': 'x' }))).toThrow(
@@ -169,6 +187,18 @@ describe('parsePluginPackage', () => {
   it('rejects a package missing its declared main file', () => {
     const buf = zipOf({ 'manifest.json': JSON.stringify(validManifest), 'other.js': 'x' });
     expect(() => parsePluginPackage(buf)).toThrow(/missing its main file/i);
+  });
+
+  it('rejects a manifest whose main escapes the plugin directory', () => {
+    // Previously only caught indirectly ("missing its main file", since an escaping main can never
+    // match an in-archive entry). The shared manifest validator now rejects it explicitly — the same
+    // message the boot-time loader enforces on a hand-placed directory.
+    for (const main of ['../evil.js', '../../etc/passwd', '/etc/passwd', '..\\evil.js']) {
+      const bad = { ...validManifest, main };
+      expect(() => parsePluginPackage(zipOf({ 'manifest.json': JSON.stringify(bad), 'index.js': 'x' }))).toThrow(
+        /escapes the plugin directory/i,
+      );
+    }
   });
 
   it('rejects too many files', () => {

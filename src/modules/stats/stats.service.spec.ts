@@ -1,3 +1,4 @@
+import { NotFoundException } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { StatsService, timeSeriesTimestampSql, hourBucketSql, maxCreatedAtSql } from './stats.service';
 import { Session, SessionStatus } from '../session/entities/session.entity';
@@ -42,7 +43,8 @@ describe('StatsService time-series + hourly activity on SQLite (end-to-end regre
     });
     await ds.initialize();
     const cache = { setSessionsStats: jest.fn() };
-    service = new StatsService(ds.getRepository(Session), ds.getRepository(Message), cache as never);
+    const config = { get: () => 30000 };
+    service = new StatsService(ds.getRepository(Session), ds.getRepository(Message), cache as never, config as never);
   });
 
   afterEach(async () => {
@@ -99,6 +101,26 @@ describe('StatsService time-series + hourly activity on SQLite (end-to-end regre
     expect(chat?.chatName).toBe('Alice');
   });
 
+  // chatName holds the SENDER's push name, so a group's MAX over it named the group after whichever member
+  // sorts last, and an outgoing row would carry the operator's own name. Only a 1:1 chat's inbound rows name it.
+  it('topChats names a 1:1 chat from its inbound rows only and leaves a group unnamed, in both queries', async () => {
+    await ds
+      .getRepository(Session)
+      .save(ds.getRepository(Session).create({ id: 's1', name: 'n', status: SessionStatus.READY, config: {} }));
+    await seedMessage({ chatId: 'g1@g.us', chatName: 'Andi', direction: MessageDirection.INCOMING });
+    await seedMessage({ chatId: 'g1@g.us', chatName: 'Zul', direction: MessageDirection.INCOMING });
+    await seedMessage({ chatId: 'bob@c.us', chatName: 'Bob', direction: MessageDirection.INCOMING });
+    await seedMessage({ chatId: 'bob@c.us', chatName: 'Zz Operator', direction: MessageDirection.OUTGOING });
+
+    const overall = await service.getMessageStats('24h');
+    expect(overall.topChats.find(c => c.chatId === 'g1@g.us')?.chatName).toBeNull();
+    expect(overall.topChats.find(c => c.chatId === 'bob@c.us')?.chatName).toBe('Bob');
+
+    const perSession = await service.getSessionStats('s1');
+    expect(perSession.topChats.find(c => c.chatId === 'g1@g.us')?.chatName).toBeNull();
+    expect(perSession.topChats.find(c => c.chatId === 'bob@c.us')?.chatName).toBe('Bob');
+  });
+
   it('getMessageStats byType excludes content-less system/event rows (no body AND no metadata)', async () => {
     await ds
       .getRepository(Session)
@@ -112,6 +134,20 @@ describe('StatsService time-series + hourly activity on SQLite (end-to-end regre
 
     const stats = await service.getMessageStats('24h');
     expect(stats.byType).toEqual({ text: 1, image: 1 });
+  });
+
+  it('getMessageStats byType counts only rows inside the period, metadata-carrying rows included', async () => {
+    await ds
+      .getRepository(Session)
+      .save(ds.getRepository(Session).create({ id: 's1', name: 'n', status: SessionStatus.READY, config: {} }));
+    const oldImage = await seedMessage({ type: 'image', body: '', metadata: { media: { mimetype: 'image/png' } } });
+    const oldReply = await seedMessage({ body: '', metadata: { quotedMessageId: 'q1' } });
+    const old = new Date(Date.now() - 20 * 24 * 60 * 60 * 1000);
+    await ds.getRepository(Message).update([oldImage.id, oldReply.id], { createdAt: old });
+    await seedMessage({ type: 'image', body: '', metadata: { media: { mimetype: 'image/png' } } });
+
+    expect((await service.getMessageStats('24h')).byType).toEqual({ image: 1 });
+    expect((await service.getMessageStats('7d')).byType).toEqual({ image: 1 });
   });
 
   it('time-series query never groups by the bare reserved word `timestamp` (Postgres-safe)', async () => {
@@ -239,5 +275,150 @@ describe('StatsService time-series + hourly activity on SQLite (end-to-end regre
     );
     expect(totals.sent).toBe(2);
     expect(totals.received).toBe(1);
+  });
+});
+
+describe('StatsService aggregate memo (in-process TTL)', () => {
+  let ds: DataSource;
+
+  beforeEach(async () => {
+    ds = new DataSource({
+      type: 'better-sqlite3',
+      database: ':memory:',
+      entities: [Session, Message],
+      synchronize: true,
+    });
+    await ds.initialize();
+    const sessions = ds.getRepository(Session);
+    await sessions.save(sessions.create({ id: 's1', name: 'n1', status: SessionStatus.READY, config: {} }));
+    await sessions.save(sessions.create({ id: 's2', name: 'n2', status: SessionStatus.READY, config: {} }));
+    const messages = ds.getRepository(Message);
+    const base = {
+      chatId: 'c1',
+      from: 'a',
+      to: 'b',
+      type: 'text',
+      direction: MessageDirection.OUTGOING,
+      status: MessageStatus.SENT,
+    };
+    await messages.save(messages.create({ ...base, sessionId: 's1' }));
+    await messages.save(messages.create({ ...base, sessionId: 's2' }));
+  });
+
+  afterEach(async () => {
+    await ds.destroy();
+  });
+
+  const makeService = (ttlMs: number) =>
+    new StatsService(
+      ds.getRepository(Session),
+      ds.getRepository(Message),
+      { setSessionsStats: jest.fn() } as never,
+      { get: () => ttlMs } as never,
+    );
+
+  it('serves a repeated identical call from the memo within the TTL (no second DB hit)', async () => {
+    const service = makeService(30000);
+    const spy = jest.spyOn(ds.getRepository(Message), 'createQueryBuilder');
+
+    await service.getMessageStats('24h');
+    const afterFirst = spy.mock.calls.length;
+    expect(afterFirst).toBeGreaterThan(0);
+
+    await service.getMessageStats('24h');
+    expect(spy.mock.calls.length).toBe(afterFirst);
+  });
+
+  it('re-runs the aggregate once the TTL has expired', async () => {
+    const service = makeService(30000);
+    const spy = jest.spyOn(ds.getRepository(Message), 'createQueryBuilder');
+    const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(1_000_000);
+    try {
+      await service.getMessageStats('24h');
+      const afterFirst = spy.mock.calls.length;
+
+      nowSpy.mockReturnValue(1_000_000 + 30_001);
+      await service.getMessageStats('24h');
+      expect(spy.mock.calls.length).toBeGreaterThan(afterFirst);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('keys the memo by query shape and by session id', async () => {
+    const service = makeService(30000);
+    const spy = jest.spyOn(ds.getRepository(Message), 'createQueryBuilder');
+
+    await service.getMessageStats('24h');
+    let n = spy.mock.calls.length;
+    await service.getMessageStats('7d'); // different period → different key → DB hit
+    expect(spy.mock.calls.length).toBeGreaterThan(n);
+
+    n = spy.mock.calls.length;
+    await service.getSessionStats('s1');
+    await service.getSessionStats('s1'); // memo hit — no new queries
+    const afterS1 = spy.mock.calls.length;
+    expect(afterS1).toBeGreaterThan(n);
+
+    await service.getSessionStats('s2'); // different session → different key → DB hit
+    expect(spy.mock.calls.length).toBeGreaterThan(afterS1);
+  });
+
+  it('a 0 TTL disables the memo (every call hits the DB)', async () => {
+    const service = makeService(0);
+    const spy = jest.spyOn(ds.getRepository(Message), 'createQueryBuilder');
+
+    await service.getMessageStats('24h');
+    const n = spy.mock.calls.length;
+    await service.getMessageStats('24h');
+    expect(spy.mock.calls.length).toBeGreaterThan(n);
+  });
+
+  it('does not serve a deleted session from the memo — the stale entry is evicted, not served', async () => {
+    const service = makeService(30000);
+
+    const first = await service.getSessionStats('s1'); // populates the 'session:s1' memo entry
+    expect(first.session.name).toBe('n1');
+
+    await ds.getRepository(Session).delete('s1');
+    // Within the TTL the memo still holds the deleted session's snapshot; serving it would
+    // resurrect a deleted session with a 200 instead of the honest 404.
+    await expect(service.getSessionStats('s1')).rejects.toThrow(NotFoundException);
+
+    // The stale entry is evicted, not just bypassed: a re-created session recomputes immediately
+    // instead of waiting out the TTL with the pre-delete snapshot.
+    await ds
+      .getRepository(Session)
+      .save(
+        ds.getRepository(Session).create({ id: 's1', name: 'n1-recreated', status: SessionStatus.READY, config: {} }),
+      );
+    const recomputed = await service.getSessionStats('s1');
+    expect(recomputed.session.name).toBe('n1-recreated');
+  });
+
+  it('bounds every cross-session aggregate with a createdAt range predicate the standalone index serves', async () => {
+    const service = makeService(30000);
+    // Capture the generated SQL the same way the reserved-word regression tests above do.
+    const captured: string[] = [];
+    const repo = ds.getRepository(Message);
+    const origCreate = repo.createQueryBuilder.bind(repo);
+    jest.spyOn(repo, 'createQueryBuilder').mockImplementation((alias?: string) => {
+      const qb = origCreate(alias);
+      const origGetRawMany = qb.getRawMany.bind(qb);
+      jest.spyOn(qb, 'getRawMany').mockImplementation((async () => {
+        captured.push(qb.getQuery());
+        return origGetRawMany();
+      }) as never);
+      return qb;
+    });
+
+    await service.getMessageStats('24h'); // time-series + byType + bySession + topChats
+
+    expect(captured.length).toBeGreaterThan(0);
+    // IDX_messages_createdAt serves `createdAt >= ?`; an unbounded GROUP BY here would be the
+    // full-history scan this service must no longer run.
+    for (const sql of captured) {
+      expect(sql).toMatch(/WHERE\s+.*"createdAt"\s*>=/i);
+    }
   });
 });

@@ -9,24 +9,24 @@
 > default** and **purely additive**: when disabled, none of its code (or the MCP SDK)
 > is loaded and every REST route behaves exactly as before.
 
-| Component | Status | Location |
-|-----------|--------|----------|
-| **Tool registry (`ToolDescriptor`)** | ✅ Implemented | `src/core/agent-tools/tool-descriptor.ts` |
-| **Tool invoker (auth → validate → service)** | ✅ Implemented | `src/core/agent-tools/tool-invoker.ts` |
-| **Registry service** | ✅ Implemented | `src/core/agent-tools/tool-registry.service.ts` |
-| **Curated tool tables (~39 tools)** | ✅ Implemented | `src/core/agent-tools/tools/*.tools.ts` |
-| **MCP transport adapter** | ✅ Implemented | `src/modules/mcp/mcp.server.ts` |
-| **Opt-in module gate** | ✅ Implemented | `src/modules/mcp/mcp.module.ts`, `src/app.module.ts` |
-| **Per-key rate limiter** | ✅ Implemented | `src/modules/mcp/mcp-rate-limit.ts` |
-| **Result shaping (smart/json)** | ✅ Implemented | `src/modules/mcp/tool-result.ts` |
+| Component                                    | Status         | Location                                             |
+| -------------------------------------------- | -------------- | ---------------------------------------------------- |
+| **Tool registry (`ToolDescriptor`)**         | ✅ Implemented | `src/core/agent-tools/tool-descriptor.ts`            |
+| **Tool invoker (auth → validate → service)** | ✅ Implemented | `src/core/agent-tools/tool-invoker.ts`               |
+| **Registry service**                         | ✅ Implemented | `src/core/agent-tools/tool-registry.service.ts`      |
+| **Curated tool tables (51 tools)**           | ✅ Implemented | `src/core/agent-tools/tools/*.tools.ts`              |
+| **MCP transport adapter**                    | ✅ Implemented | `src/modules/mcp/mcp.server.ts`                      |
+| **Opt-in module gate**                       | ✅ Implemented | `src/modules/mcp/mcp.module.ts`, `src/app.module.ts` |
+| **Per-key rate limiter**                     | ✅ Implemented | `src/modules/mcp/mcp-rate-limit.ts`                  |
+| **Result shaping (smart/json)**              | ✅ Implemented | `src/modules/mcp/tool-result.ts`                     |
 
-| Capability | Status | Notes |
-|-----------|--------|-------|
-| **Read-only mode** | ✅ Implemented | **Default read-only**; set `MCP_READONLY=false` to expose write tools |
-| **OAuth 2.1 (public exposure)** | 🔜 Planned | Static API key is used today (suitable for self-hosted/internal) |
-| **Agent-action audit provenance** | 🔜 Planned | Mark audited actions as agent-initiated |
-| **Env-tunable rate limits** | ✅ Implemented | `MCP_RATE_LIMIT_MAX` / `MCP_RATE_LIMIT_WINDOW_MS` |
-| **Additional tool domains** | 🔜 Planned | labels / templates / channels / catalog / status as an opt-in expansion |
+| Capability                        | Status         | Notes                                                                 |
+| --------------------------------- | -------------- | --------------------------------------------------------------------- |
+| **Read-only mode**                | ✅ Implemented | **Default read-only**; set `MCP_READONLY=false` to expose write tools |
+| **OAuth 2.1 (public exposure)**   | 🔜 Planned     | Static API key is used today (suitable for self-hosted/internal)      |
+| **Agent-action audit provenance** | 🔜 Planned     | Mark audited actions as agent-initiated                               |
+| **Env-tunable rate limits**       | ✅ Implemented | `MCP_RATE_LIMIT_MAX` / `MCP_RATE_LIMIT_WINDOW_MS`                     |
+| **Additional tool domains**       | 🔜 Planned     | templates / channels / catalog / status (labels/automation now ship)  |
 
 ---
 
@@ -39,8 +39,10 @@ group management — so an agent can drive WhatsApp through the same business lo
 REST API uses.
 
 Set `MCP_ENABLED=true` to mount a stateless Streamable-HTTP transport at **`POST /mcp`**
-on the existing server (same port, no extra process). When `MCP_ENABLED` is unset, the
-MCP module and the `@modelcontextprotocol/sdk` package are never loaded.
+on the existing server (same port, no extra process). The transport offers no SSE stream
+and no sessions, so `GET /mcp` and `DELETE /mcp` answer `405` with `Allow: POST`. When
+`MCP_ENABLED` is unset, the MCP module and the `@modelcontextprotocol/sdk` package are
+never loaded.
 
 ## 24.2 Design Goals
 
@@ -81,7 +83,7 @@ flowchart TB
 flowchart LR
     Client[MCP client] -->|POST /mcp| Adapter
     subgraph Core["src/core/agent-tools (SDK-free)"]
-        Registry[ToolRegistryService<br/>~39 ToolDescriptors]
+        Registry[ToolRegistryService<br/>51 ToolDescriptors]
         Invoker[invokeTool<br/>auth → validate → handler]
     end
     subgraph Adapter["src/modules/mcp (SDK, opt-in)"]
@@ -99,7 +101,7 @@ A tool call flows through four steps, in this order:
 
 1. **Key extraction.** The adapter reads the API key from the `X-API-Key` header or
    `Authorization: Bearer …`.
-2. **Authentication.** `invokeTool` calls `AuthService.validateApiKey()` — the *same*
+2. **Authentication.** `invokeTool` calls `AuthService.validateApiKey()` — the _same_
    method the REST `ApiKeyGuard` uses — which enforces validity, expiry, the per-session
    `allowedSessions` scope, and the IP allow-list (fail-closed). Then `hasPermission()`
    enforces the tool's required role. Auth runs **before** the handler.
@@ -116,18 +118,32 @@ down on response close — any request can hit any instance.
 
 The surface is an **allowlist by construction** — a capability is exposed only if a
 `ToolDescriptor` is written for it. There is no automatic route reflection. Each tool
-declares a `tier` (`read` | `write`) and, for writes, a required role.
+declares a `tier` (`read` | `write`) and a `requiredRole` when the call warrants one: every
+write carries its privilege level, and a read carries the role its REST twin requires. The
+reads at OPERATOR are `WebhooksList`, `WebhookFindBySession` and `WebhookFindOne`,
+`AutomationRuleFindAll` and `AutomationRuleFindOne`, and `GroupGetInviteCode` (the invite
+code is a transferable join capability, so it sits at OPERATOR like the QR endpoint).
 
-| Domain | Read tools | Write tools |
-|--------|-----------|-------------|
-| **Session** | list, get, chats, stats | mark read/unread, typing |
-| **Message** | list, history, reactions | send text/image/video/audio/document/location/contact/sticker/template, reply, forward, react |
-| **Contact** | list, get, check-number, resolve-phone, profile-picture | block, unblock |
-| **Group** | list, get, invite-code | create, add participants, set subject, set description |
-| **Webhook** | list, get (read-only) | — |
+| Domain         | Read tools                                              | Write tools                                                                                   |
+| -------------- | ------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| **Session**    | list, get, chats, stats, presence                       | mark read/unread, typing, subscribe presence                                                  |
+| **Message**    | list, history, reactions                                | send text/image/video/audio/document/location/contact/sticker/template, reply, forward, react |
+| **Contact**    | list, get, check-number, resolve-phone, profile-picture | block, unblock                                                                                |
+| **Group**      | list, get, invite-code (OPERATOR)                       | create, add participants, set subject, set description                                        |
+| **Webhook**    | list, get (OPERATOR)                                    | —                                                                                             |
+| **Label**      | list, get, chats for a label, labels on a chat          | upsert, delete, add to chat, remove from chat                                                 |
+| **Automation** | rules list, get (OPERATOR)                              | —                                                                                             |
+
+> **Labels split across the engines**, and each tool's description says which way. Every label
+> _read_ needs whatsapp-web.js — Baileys exposes no label query at all. Editing a label (upsert,
+> delete) needs Baileys — whatsapp-web.js cannot change a label. Only tagging and untagging a chat
+> works on both. An agent told this can pick the right call; one that is not will read the `501` as
+> a transient failure and retry something that cannot succeed on that engine. Labels are a WhatsApp
+> Business feature throughout.
 
 **Deliberately excluded from the surface** (not exposed as tools): session lifecycle
-(create/delete/start/stop/force-kill), chat delete, bulk send, message delete, message edit, group
+(create/delete/start/stop/logout/force-kill), chat delete, bulk send, message delete, message edit,
+group
 leave/remove/promote/demote/invite-revoke/join, group settings writes, all own-profile writes
 (name/status/picture), call reject, all API-key management, all plugin management,
 infrastructure import/export/restart, settings writes, and webhook create/update/delete.
@@ -151,16 +167,22 @@ only when an agent genuinely needs to send messages / mutate state.
 - **No IP allow-list over MCP.** There is no genuine client IP on a tool call, so a key
   that carries an `allowedIps` list will be rejected. Use a key without `allowedIps` for
   MCP.
-- **Rate limiting.** A per-key limiter (keyed by the *authenticated* key id) bounds tool
-  calls. Buckets are pruned when idle. This is independent of the REST throttler.
+- **Rate limiting.** A per-key limiter (keyed by the _authenticated_ key id) bounds tool
+  calls. The key map is capped (approximate-LRU eviction at 50,000 keys), so a
+  distinct-key flood cannot grow process memory without limit. This is independent of
+  the REST throttler.
   Tune with `MCP_RATE_LIMIT_MAX` (default `60`) and `MCP_RATE_LIMIT_WINDOW_MS`
   (default `60000`). Any missing, blank, non-positive, or non-numeric value falls back
-  to the default. A **second, pre-auth per-IP throttle** runs on the `/mcp` mount *before*
+  to the default. A **second, pre-auth per-IP throttle** runs on the `/mcp` mount _before_
   key validation (the raw Express mount bypasses the global REST throttler, so a
   missing/invalid key would otherwise reach a DB lookup unthrottled). It keys on the
   resolved client IP (honoring `TRUSTED_PROXIES`) and is tuned with `MCP_IP_RATE_LIMIT_MAX`
   (default `120`) and `MCP_IP_RATE_LIMIT_WINDOW_MS` (default `60000`), with the same
-  fallback rules — independent of the per-key vars.
+  fallback rules, independent of the per-key vars. It counts JSON-RPC messages, not HTTP
+  requests: each element of a batch spends one unit, and a batch larger than the
+  remaining budget is refused whole with a `429`. None of its messages run, but the
+  refusal still spends whatever budget was left, so the IP is at the cap until the
+  window slides.
 - **Response parity.** Tools reuse the REST response DTOs, so sensitive fields the REST
   API strips (e.g. webhook HMAC secrets and custom headers, session proxy URLs and engine
   config) are **not** exposed over MCP.
@@ -176,7 +198,7 @@ MCP_ENABLED=true npm run start:prod   # or set MCP_ENABLED in your .env / compos
 MCP_READONLY=false                    # expose write tools (default is read-only when unset)
 MCP_RATE_LIMIT_MAX=60                 # max tool calls per key per window (default 60)
 MCP_RATE_LIMIT_WINDOW_MS=60000        # sliding window in ms (default 60000 = 1 min)
-MCP_IP_RATE_LIMIT_MAX=120             # pre-auth per-IP request cap per window (default 120)
+MCP_IP_RATE_LIMIT_MAX=120             # pre-auth per-IP message cap per window (default 120)
 MCP_IP_RATE_LIMIT_WINDOW_MS=60000     # per-IP window in ms (default 60000 = 1 min)
 ```
 
@@ -220,7 +242,9 @@ Guidelines:
 - **Reuse the response DTO** the matching REST controller uses (e.g.
   `WebhookResponseDto.fromEntity`, `SessionResponseDto.fromEntity`). Returning a raw entity
   can leak fields the REST API deliberately strips.
-- Mark writes with `tier: 'write'` and the appropriate `requiredRole`.
+- Mark writes with `tier: 'write'` and the appropriate `requiredRole`. Give a read the same
+  `requiredRole` as the REST route it mirrors: the webhook and automation-rule reads and
+  `GroupGetInviteCode` sit at OPERATOR because their REST routes do.
 - Use `sessionScoped: true` and a non-empty `sessionId` field for any per-session tool so
   the scope check applies.
 - A snapshot test (`tool-registry.spec.ts`) locks the public tool-name set; update it
@@ -232,8 +256,8 @@ Guidelines:
   intended for self-hosted/internal use).
 - **Agent-action audit provenance** — record that an audited action was agent-initiated
   and by which key.
-- **Expansion-pack tool domains** — labels, templates, channels, catalog, and status are
-  not in the default surface yet.
+- **Expansion-pack tool domains** — templates, channels, catalog, and status are not in the
+  default surface yet. Labels and automation-rule reads already are.
 - **Stateful MCP sessions / SSE reconnect, prompts, elicitation** — out of scope; the
   transport is intentionally stateless.
 

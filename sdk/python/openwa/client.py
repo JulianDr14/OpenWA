@@ -11,8 +11,10 @@ transport) and exposes domain resources as properties::
         api_key="owa_k1_…",
     )
 
-    client.sessions.start("my-session")
-    client.messages.send_text("my-session", {
+    # Sessions are addressed by the UUID that create() returns, not by name.
+    session = client.sessions.create({"name": "my-session"})
+    client.sessions.start(session["id"])
+    client.messages.send_text(session["id"], {
         "chatId": "628123456789@c.us",
         "text": "Hello from the OpenWA SDK!",
     })
@@ -33,6 +35,7 @@ import httpx
 from ._http import HttpExecutor, HttpMethod
 from .resources import (
     CallsResource,
+    MediaResource,
     CatalogResource,
     ChannelsResource,
     ChatsResource,
@@ -158,6 +161,10 @@ class OpenWAClient:
     @property
     def calls(self) -> CallsResource:
         return CallsResource(self._http)
+
+    @property
+    def media(self) -> MediaResource:
+        return MediaResource(self._http)
 
     # ── Auth ─────────────────────────────────────────────────────────
 

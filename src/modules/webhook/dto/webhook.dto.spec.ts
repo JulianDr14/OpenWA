@@ -23,6 +23,12 @@ describe('webhook DTO event validation', () => {
     ).toHaveLength(0);
   });
 
+  it("CreateWebhookDto: accepts 'status.received'", async () => {
+    expect(
+      await errorsFor(CreateWebhookDto, { url: 'https://x.example/hook', events: ['status.received'] }),
+    ).toHaveLength(0);
+  });
+
   it('UpdateWebhookDto: rejects an empty events array (ArrayMinSize parity)', async () => {
     const errs = await errorsFor(UpdateWebhookDto, { events: [] });
     expect(errs.some(e => e.property === 'events')).toBe(true);
@@ -31,6 +37,20 @@ describe('webhook DTO event validation', () => {
   it('UpdateWebhookDto: rejects an unknown event', async () => {
     const errs = await errorsFor(UpdateWebhookDto, { events: ['nope'] });
     expect(errs.some(e => e.property === 'events')).toBe(true);
+  });
+
+  // These columns are NOT NULL: @IsOptional let null through and save() then answered 500.
+  it.each(['url', 'events', 'headers', 'active', 'retryCount'])(
+    'UpdateWebhookDto: rejects null for the NOT NULL field %s',
+    async field => {
+      const errs = await errorsFor(UpdateWebhookDto, { [field]: null });
+      expect(errs.map(e => e.property)).toEqual([field]);
+    },
+  );
+
+  it('UpdateWebhookDto: still accepts an omitted field and a null filters (nullable column)', async () => {
+    expect(await errorsFor(UpdateWebhookDto, {})).toHaveLength(0);
+    expect(await errorsFor(UpdateWebhookDto, { filters: null })).toHaveLength(0);
   });
 });
 

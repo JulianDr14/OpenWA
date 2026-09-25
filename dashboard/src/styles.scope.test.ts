@@ -25,17 +25,30 @@ function selectors(css: string): string[] {
     let j = i;
     while (j < n && css[j] !== '{' && css[j] !== '}') j++;
     if (j >= n) break;
-    if (css[j] === '}') { i = j + 1; continue; }
+    if (css[j] === '}') {
+      i = j + 1;
+      continue;
+    }
     const header = css.slice(i, j).trim();
-    let depth = 1, k = j + 1;
-    while (k < n && depth) { if (css[k] === '{') depth++; else if (css[k] === '}') depth--; k++; }
+    let depth = 1,
+      k = j + 1;
+    while (k < n && depth) {
+      if (css[k] === '{') depth++;
+      else if (css[k] === '}') depth--;
+      k++;
+    }
     const body = css.slice(j + 1, k - 1);
     if (/^@keyframes|^@font-face|^@page/.test(header)) {
       /* keyframe/font selectors are not class-scoped — skip */
     } else if (/^@media|^@supports|^@container/.test(header)) {
       out.push(...selectors(body)); // recurse: inner rules must still be scoped
     } else if (header) {
-      out.push(...header.split(',').map(s => s.trim()).filter(Boolean));
+      out.push(
+        ...header
+          .split(',')
+          .map(s => s.trim())
+          .filter(Boolean),
+      );
     }
     i = k;
   }
@@ -61,3 +74,24 @@ for (const file of files) {
     );
   });
 }
+
+// A search box drops its input's own outline and draws the frame around it instead, so the frame
+// has to show keyboard focus: with neither, a keyboard user cannot see the field is focused.
+const SEARCH_BOXES: Record<string, string> = {
+  'Sessions.css': '.sessions-page .search-input',
+  'Logs.css': '.logs-page .search-input',
+  'Chats.css': '.chats-page .chat-search-input',
+  'Templates.css': '.templates-page .templates-search',
+  'Plugins.css': '.plugins-page .catalog-search',
+};
+
+test('every page search box shows keyboard focus on its frame', () => {
+  const missing = Object.entries(SEARCH_BOXES).filter(
+    ([file, box]) =>
+      !selectors(stripComments(readFileSync(join(PAGES_DIR, file), 'utf8'))).includes(`${box}:focus-within`),
+  );
+  assert.deepEqual(
+    missing.map(([file, box]) => `${file}: ${box}`),
+    [],
+  );
+});

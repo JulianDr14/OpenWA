@@ -8,6 +8,20 @@ import {
 import type { SearchQuery, SearchResults } from '../../../modules/search/search.types';
 
 /**
+ * Capability verbs whose host-side work IS an outbound message send. A media send (the URL
+ * download — itself bounded at 30s by MEDIA_DOWNLOAD_TIMEOUT_MS — then the WhatsApp upload) can
+ * legitimately outrun the lookup-oriented capTimeoutMs, and a cap timeout does NOT cancel the
+ * underlying work: the worker would record a failure while the message still lands, and a plugin
+ * retrying on that error would deliver a duplicate. These verbs therefore get
+ * SEND_CAP_TIMEOUT_FACTOR × the base budget (see withCapTimeout), so the timeout stays a "wedged
+ * call" signal instead of firing inside normal execution. The in-flight bound is unchanged.
+ */
+const SEND_CAP_VERBS: ReadonlySet<string> = new Set(['messages.sendText', 'messages.reply', 'conversation.send']);
+
+/** Send-verb budget as a multiple of capTimeoutMs (default 30s → 120s: the 30s media download + upload headroom). */
+const SEND_CAP_TIMEOUT_FACTOR = 4;
+
+/**
  * Host-side driver for a single untrusted plugin running in a worker. Owns the request/response
  * correlation over a {@link PluginWorkerChannel}: it posts `load`/`lifecycle` messages and resolves
  * the matching promise when the worker replies, and fails every outstanding call if the worker dies.
@@ -30,7 +44,10 @@ export class PluginWorkerHost {
   >();
   private readonly hookPending = new Map<
     number,
-    { resolve: (result: { continue: boolean; data?: unknown }) => void; timer: ReturnType<typeof setTimeout> }
+    {
+      resolve: (result: { continue: boolean; data?: unknown; error?: string }) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
   >();
   private readonly webhookPending = new Map<
     number,
@@ -56,10 +73,10 @@ export class PluginWorkerHost {
       timer: ReturnType<typeof setTimeout>;
     }
   >();
-  // Hook events currently dispatched to the worker and not yet settled, as a multiset. While the
-  // worker handles a hook it may issue capability calls that round-trip to the host; those run inside
-  // this in-flight set so a capability that re-fires the same event is short-circuited (HookManager's
-  // AsyncLocalStorage re-entrancy guard does not span the worker IPC boundary).
+  // Hook events (each dispatch's event plus its host-side ancestors) currently dispatched to the worker
+  // and not yet settled, as a multiset. A capability call names the chain of the dispatch it came from;
+  // this set bounds that claim, so a worker can never mark an event in flight that the host did not
+  // actually dispatch to it (HookManager's AsyncLocalStorage guard does not span the IPC boundary).
   private readonly inFlightHookEvents = new Map<string, number>();
 
   // Worker-initiated capability calls currently running host-side, bounded by maxInFlightCaps.
@@ -97,6 +114,11 @@ export class PluginWorkerHost {
     // Called once after the worker exits (crash or terminate), after in-flight calls are drained, so the
     // loader can release plugin-owned host resources (e.g. unregister a search provider the worker declared).
     private readonly onExit?: (code: number, intentional: boolean) => void,
+    // Host-side budget for ONE capability call. A worker whose calls hang would otherwise hold its
+    // in-flight slots forever (self-DoS once maxInFlightCaps are all wedged). On timeout the worker gets
+    // an error cap-result and the slot frees; the underlying host-side work is NOT cancelled (see
+    // withCapTimeout). Absent/undefined => no per-call timeout (legacy behavior).
+    private readonly capTimeoutMs?: number,
   ) {
     this.channel.onMessage(message => this.handleMessage(message));
     this.channel.onExit(code => this.handleExit(code));
@@ -116,7 +138,9 @@ export class PluginWorkerHost {
   /**
    * Dispatch a hook event to the worker and await its handler result. Bounded by `timeoutMs`: if the
    * worker's handler is slow or wedged, this resolves `{ continue: true }` so the host's hook chain
-   * is never stalled by an untrusted plugin (and `onTimeout` flags it for the caller).
+   * is never stalled by an untrusted plugin (and `onTimeout` flags it for the caller). When the worker
+   * reports that one of its handlers threw, the resolved `error` carries the first failure so the
+   * caller can surface it — the chain still fails open.
    */
   dispatchHook(options: {
     event: string;
@@ -124,21 +148,25 @@ export class PluginWorkerHost {
     source: string;
     sessionId?: string;
     config?: Record<string, unknown>;
+    // Events already in flight on the host's hook chain when this dispatch fires (the caller's
+    // ancestors); forwarded so a capability call the handler makes is guarded against all of them.
+    inFlight?: string[];
     timeoutMs: number;
     onTimeout?: () => void;
-  }): Promise<{ continue: boolean; data?: unknown }> {
+  }): Promise<{ continue: boolean; data?: unknown; error?: string }> {
     // Fail fast on a dead worker: a post-crash dispatchHook (the hook shim still holds the stale host
     // reference) would otherwise post to the dead worker and stall the chain for the full timeout before
     // resolving. The fail-open { continue: true } matches what the per-call timeout + the in-flight
     // crash-drain already produce.
     if (this.dead) return Promise.resolve({ continue: true });
     const id = this.nextId++;
-    this.incInFlightHook(options.event);
+    const inFlight = [...new Set([...(options.inFlight ?? []), options.event])];
+    for (const event of inFlight) this.incInFlightHook(event);
     return new Promise(resolve => {
-      // settle decrements the in-flight counter on every exit path (worker result, timeout, or crash
+      // settle decrements the in-flight counters on every exit path (worker result, timeout, or crash
       // drain) since it is what the hookPending entry's resolve runs.
-      const settle = (result: { continue: boolean; data?: unknown }): void => {
-        this.decInFlightHook(options.event);
+      const settle = (result: { continue: boolean; data?: unknown; error?: string }): void => {
+        for (const event of inFlight) this.decInFlightHook(event);
         resolve(result);
       };
       const timer = setTimeout(() => {
@@ -155,6 +183,7 @@ export class PluginWorkerHost {
         sessionId: options.sessionId,
         source: options.source,
         config: options.config,
+        inFlight,
       });
     });
   }
@@ -351,8 +380,9 @@ export class PluginWorkerHost {
         if (!waiter) return;
         this.hookPending.delete(message.id);
         clearTimeout(waiter.timer);
-        const result: { continue: boolean; data?: unknown } = { continue: message.continue };
+        const result: { continue: boolean; data?: unknown; error?: string } = { continue: message.continue };
         if (message.data !== undefined) result.data = message.data;
+        if (message.error !== undefined) result.error = message.error;
         waiter.resolve(result);
         break;
       }
@@ -411,12 +441,18 @@ export class PluginWorkerHost {
     try {
       const dispatcher = this.capDispatcher;
       const run = (): Promise<unknown> => dispatcher(message.verb, message.args);
-      // Run inside the in-flight hook context so a capability that re-fires an event this worker is
-      // currently handling is short-circuited by HookManager's re-entrancy guard (which otherwise
-      // can't see across the IPC boundary). No hooks in flight => run directly, no wrapping cost.
-      const inFlight = [...this.inFlightHookEvents.keys()];
-      const result =
-        this.runWithHookGuard && inFlight.length > 0 ? await this.runWithHookGuard(inFlight, run) : await run();
+      // Run inside the in-flight hook context of the dispatch whose handler issued this call, so a
+      // capability that re-fires that event is short-circuited by HookManager's re-entrancy guard
+      // (which otherwise can't see across the IPC boundary). Only that causal chain is guarded: a call
+      // from an ingress handler or a timer carries none, and must still run every plugin's hooks
+      // (a moderation veto on message:sending included) even while another dispatch is pending. The
+      // worker's claim is untrusted, so only events this host has dispatched to it and not yet settled
+      // are honoured. A worker can still echo a pending event from outside that handler, but that grants
+      // nothing a genuinely re-entrant call from inside the pending handler would not.
+      const claimed: unknown[] = Array.isArray(message.inFlight) ? message.inFlight : [];
+      const inFlight = claimed.filter((e): e is string => typeof e === 'string' && this.inFlightHookEvents.has(e));
+      const work = this.runWithHookGuard && inFlight.length > 0 ? this.runWithHookGuard(inFlight, run) : run();
+      const result = await this.withCapTimeout(message.verb, work);
       this.channel.postMessage({ kind: 'cap-result', id: message.id, ok: true, result });
     } catch (error) {
       this.channel.postMessage({
@@ -428,6 +464,56 @@ export class PluginWorkerHost {
     } finally {
       this.inFlightCaps--;
     }
+  }
+
+  /**
+   * Bound one capability call host-side. On timeout the caller (the worker) gets an error cap-result
+   * and the in-flight slot frees, so a plugin whose calls hang can't wedge all maxInFlightCaps slots
+   * into a self-DoS. The underlying host-side work is NOT cancelled — host verbs hold no cancellation
+   * token — so when it eventually settles the outcome is only logged as a WARN and its result is
+   * discarded (never a second cap-result). This is a robustness bound, not an atomicity guarantee: a
+   * timed-out call may still complete its side effect late (e.g. a message send that lands after the
+   * caller already saw the timeout error). To keep that late-settle window small where a duplicate is
+   * user-visible, send verbs (SEND_CAP_VERBS) run on a wider budget that covers normal execution.
+   */
+  private withCapTimeout(verb: string, work: Promise<unknown>): Promise<unknown> {
+    if (this.capTimeoutMs === undefined) return work;
+    const timeoutMs = SEND_CAP_VERBS.has(verb) ? this.capTimeoutMs * SEND_CAP_TIMEOUT_FACTOR : this.capTimeoutMs;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        // Late settle: warn exactly once, whichever way the work ends. These handlers also keep a
+        // late rejection from surfacing as an unhandled promise rejection.
+        work.then(
+          () =>
+            this.onLog?.(
+              'warn',
+              `capability '${verb}' settled after the ${timeoutMs}ms host timeout; its late result was discarded`,
+              { action: 'sandbox_cap_late_settle', verb },
+            ),
+          (error: unknown) =>
+            this.onLog?.(
+              'warn',
+              `capability '${verb}' failed after the ${timeoutMs}ms host timeout: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+              { action: 'sandbox_cap_late_settle', verb },
+            ),
+        );
+        reject(new Error(`capability '${verb}' timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      work.then(
+        result => {
+          clearTimeout(timer);
+          resolve(result);
+        },
+        (error: unknown) => {
+          clearTimeout(timer);
+          // The worker sees the dispatcher's failure verbatim when it is an Error; wrap anything else
+          // (a hostile/buggy dispatcher rejecting with a non-Error must not break the wire shape).
+          reject(error instanceof Error ? error : new Error(String(error)));
+        },
+      );
+    });
   }
 
   private handleExit(code: number): void {

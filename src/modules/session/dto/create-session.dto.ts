@@ -1,5 +1,6 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsString, IsOptional, MaxLength, MinLength, Matches, IsIn, IsUrl } from 'class-validator';
+import { IsIn, IsObject, IsOptional, IsString, IsUrl, Matches, MaxLength, MinLength, Validate } from 'class-validator';
+import { HasDecodableProxyCredentialsConstraint } from './has-decodable-proxy-credentials.validator';
 
 export class CreateSessionDto {
   @ApiProperty({
@@ -14,15 +15,23 @@ export class CreateSessionDto {
   @Matches(/^[a-zA-Z0-9-]+$/, {
     message: 'Session name can only contain letters, numbers, and hyphens',
   })
-  name: string;
+  name!: string;
 
   @ApiPropertyOptional({
     description:
-      'Session configuration options. Set autoRejectCalls (boolean, default false) to ' +
-      'automatically reject incoming calls — the call.received event is still emitted.',
-    example: { autoReconnect: true },
+      'Session configuration. Only three keys are read: autoRejectCalls (boolean, default false, ' +
+      'Baileys engine only) rejects incoming calls as soon as they ring, and the call.received event is still emitted ' +
+      'first; maxReconnectAttempts (0-20, default unlimited) caps consecutive reconnects and ' +
+      'reconnectBaseDelay (1000-300000 ms, default 5000) sets the backoff base, both for the ' +
+      "gateway's own reconnect only (on Baileys the engine retries a transient drop itself, with a " +
+      'fixed backoff and no cap). Anything else is ' +
+      'stored but ignored. All three can be changed later with PATCH /api/sessions/{sessionId}/config ' +
+      'without a restart: autoRejectCalls applies from the next incoming call, the two reconnect settings ' +
+      'from the next session start.',
+    example: { autoRejectCalls: false, maxReconnectAttempts: 5, reconnectBaseDelay: 5000 },
   })
   @IsOptional()
+  @IsObject()
   config?: Record<string, unknown>;
 
   // Phase 3: Proxy per session
@@ -50,6 +59,7 @@ export class CreateSessionDto {
     },
     { message: 'proxyUrl must be a valid http(s)/socks4/socks5 URL' },
   )
+  @Validate(HasDecodableProxyCredentialsConstraint)
   proxyUrl?: string;
 
   @ApiPropertyOptional({

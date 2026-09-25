@@ -194,6 +194,206 @@ describe('PluginWorkerHost', () => {
     });
   });
 
+  describe('capability call host timeout', () => {
+    // Microtask-only flush: these tests run under fake timers, where setImmediate is faked too.
+    const microFlush = async (): Promise<void> => {
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    };
+
+    it('times out a hung call: errors the worker, frees the slot, and warns (once) on late settle', async () => {
+      jest.useFakeTimers();
+      try {
+        const ch = new FakeChannel();
+        let settleHung: (v: unknown) => void = () => undefined;
+        const dispatcher = jest
+          .fn()
+          .mockImplementationOnce(() => new Promise(r => (settleHung = r))) // hangs past the timeout
+          .mockResolvedValue({ ok: true });
+        const onLog = jest.fn();
+        // maxInFlightCaps = 1 (7th arg) so the freed slot is observable; capTimeoutMs = 100 (10th arg).
+        new PluginWorkerHost(ch, dispatcher, undefined, undefined, onLog, undefined, 1, undefined, undefined, 100);
+
+        ch.reply({ kind: 'cap', id: 1, verb: 'engine.getContacts', args: [] });
+        await microFlush();
+        expect(dispatcher).toHaveBeenCalledTimes(1);
+
+        jest.advanceTimersByTime(100);
+        await microFlush();
+
+        // The worker sees a timeout error for the hung call.
+        const timedOut = ch.sent.find(m => m.kind === 'cap-result' && m.id === 1) as
+          { ok: boolean; error?: string } | undefined;
+        expect(timedOut?.ok).toBe(false);
+        expect(timedOut?.error).toMatch(/timed out after 100ms/);
+
+        // The slot is freed: a fresh call dispatches immediately and resolves normally.
+        ch.reply({ kind: 'cap', id: 2, verb: 'engine.getContacts', args: [] });
+        await microFlush();
+        expect(dispatcher).toHaveBeenCalledTimes(2);
+        expect(ch.sent.find(m => m.kind === 'cap-result' && m.id === 2)).toMatchObject({ ok: true });
+
+        // The hung work eventually settles: no second cap-result for id 1, only a WARN via onLog.
+        settleHung({ late: true });
+        await microFlush();
+        expect(ch.sent.filter(m => m.kind === 'cap-result' && m.id === 1)).toHaveLength(1);
+        expect(onLog).toHaveBeenCalledTimes(1);
+        expect(onLog).toHaveBeenCalledWith(
+          'warn',
+          expect.stringMatching(/late result was discarded/),
+          expect.objectContaining({ action: 'sandbox_cap_late_settle', verb: 'engine.getContacts' }),
+        );
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('gives a send verb a wider budget: a send outrunning the base budget still reports success', async () => {
+      jest.useFakeTimers();
+      try {
+        const ch = new FakeChannel();
+        // A send that runs longer than the base budget but inside the send budget must NOT be
+        // reported as failed to the worker (the send would still land → a retry would duplicate it).
+        let settleSend: (v: unknown) => void = () => undefined;
+        const dispatcher = jest.fn().mockImplementation(() => new Promise(r => (settleSend = r)));
+        const onLog = jest.fn();
+        // capTimeoutMs = 100 (10th arg) → send budget 400.
+        new PluginWorkerHost(
+          ch,
+          dispatcher,
+          undefined,
+          undefined,
+          onLog,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          100,
+        );
+
+        ch.reply({ kind: 'cap', id: 1, verb: 'conversation.send', args: [{ type: 'image' }] });
+        await microFlush();
+        jest.advanceTimersByTime(100); // a lookup would be timed out here
+        await microFlush();
+        expect(ch.sent.find(m => m.kind === 'cap-result' && m.id === 1)).toBeUndefined();
+
+        settleSend({ messageId: 'wamid' }); // lands at ~100ms, inside the send budget
+        await microFlush();
+        expect(ch.sent.find(m => m.kind === 'cap-result' && m.id === 1)).toMatchObject({
+          ok: true,
+          result: { messageId: 'wamid' },
+        });
+        jest.advanceTimersByTime(1000); // the timer was cleared — no late timeout, no warn
+        await microFlush();
+        expect(onLog).not.toHaveBeenCalled();
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('still bounds a wedged send — it times out at the send budget and frees the slot', async () => {
+      jest.useFakeTimers();
+      try {
+        const ch = new FakeChannel();
+        const dispatcher = jest.fn().mockImplementation(() => new Promise(() => undefined)); // never settles
+        const onLog = jest.fn();
+        // maxInFlightCaps = 1 (7th arg) so the freed slot is observable; capTimeoutMs = 100 → send budget 400.
+        new PluginWorkerHost(ch, dispatcher, undefined, undefined, onLog, undefined, 1, undefined, undefined, 100);
+
+        ch.reply({ kind: 'cap', id: 1, verb: 'messages.sendText', args: ['s1', 'c1', 'hi'] });
+        await microFlush();
+        jest.advanceTimersByTime(399);
+        await microFlush();
+        expect(ch.sent.find(m => m.kind === 'cap-result' && m.id === 1)).toBeUndefined();
+
+        jest.advanceTimersByTime(1); // 400: the send budget elapses
+        await microFlush();
+        const timedOut = ch.sent.find(m => m.kind === 'cap-result' && m.id === 1) as
+          { ok: boolean; error?: string } | undefined;
+        expect(timedOut?.ok).toBe(false);
+        expect(timedOut?.error).toMatch(/timed out after 400ms/);
+
+        ch.reply({ kind: 'cap', id: 2, verb: 'engine.getContacts', args: [] });
+        await microFlush();
+        expect(dispatcher).toHaveBeenCalledTimes(2); // slot freed at the send timeout
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('warns (not crashes) when the hung work fails after the timeout', async () => {
+      jest.useFakeTimers();
+      try {
+        const ch = new FakeChannel();
+        let failHung: (e: unknown) => void = () => undefined;
+        const dispatcher = jest.fn().mockImplementationOnce(() => new Promise((_, rej) => (failHung = rej)));
+        const onLog = jest.fn();
+        new PluginWorkerHost(
+          ch,
+          dispatcher,
+          undefined,
+          undefined,
+          onLog,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          100,
+        );
+
+        ch.reply({ kind: 'cap', id: 1, verb: 'engine.getContacts', args: [] });
+        await microFlush();
+        jest.advanceTimersByTime(100);
+        await microFlush();
+        expect(ch.sent.find(m => m.kind === 'cap-result' && m.id === 1)).toMatchObject({ ok: false });
+
+        failHung(new Error('engine blew up'));
+        await microFlush();
+        expect(onLog).toHaveBeenCalledWith(
+          'warn',
+          expect.stringMatching(/failed after the 100ms host timeout: engine blew up/),
+          expect.objectContaining({ action: 'sandbox_cap_late_settle' }),
+        );
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('leaves a call that settles within the budget untouched (no timeout, no warn)', async () => {
+      jest.useFakeTimers();
+      try {
+        const ch = new FakeChannel();
+        const dispatcher = jest.fn().mockResolvedValue({ messageId: 'wamid' });
+        const onLog = jest.fn();
+        new PluginWorkerHost(
+          ch,
+          dispatcher,
+          undefined,
+          undefined,
+          onLog,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          1000,
+        );
+
+        ch.reply({ kind: 'cap', id: 1, verb: 'messages.sendText', args: [] });
+        await microFlush();
+        expect(ch.sent.find(m => m.kind === 'cap-result' && m.id === 1)).toMatchObject({
+          ok: true,
+          result: { messageId: 'wamid' },
+        });
+
+        jest.advanceTimersByTime(5000); // budget long past — the timer must have been cleared
+        await microFlush();
+        expect(ch.sent.filter(m => m.kind === 'cap-result' && m.id === 1)).toHaveLength(1);
+        expect(onLog).not.toHaveBeenCalled();
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+  });
+
   describe('hook bridge', () => {
     const flush = (): Promise<void> => new Promise(resolve => setImmediate(resolve));
 
@@ -243,6 +443,17 @@ describe('PluginWorkerHost', () => {
       await expect(pending).resolves.toEqual({ continue: true });
       expect(onTimeout).toHaveBeenCalled();
       jest.useRealTimers();
+    });
+
+    it('dispatchHook surfaces a worker-reported handler error on the resolved result', async () => {
+      const ch = new FakeChannel();
+      const host = new PluginWorkerHost(ch);
+
+      const pending = host.dispatchHook({ event: 'message:received', data: {}, source: 'Engine', timeoutMs: 1000 });
+      const sent = ch.sent.find(m => m.kind === 'hook') as Extract<HostToWorkerMessage, { kind: 'hook' }>;
+
+      ch.reply({ kind: 'hook-result', id: sent.id, continue: true, error: 'handler blew up' });
+      await expect(pending).resolves.toEqual({ continue: true, error: 'handler blew up' });
     });
 
     it('drains an in-flight hook immediately on worker exit (no stall for the full hook timeout)', async () => {
@@ -512,9 +723,17 @@ describe('PluginWorkerHost', () => {
       const firstHooks = ch.sent.filter(m => m.kind === 'hook');
       expect(firstHooks).toHaveLength(1);
       const hookId = firstHooks[0].id;
+      expect(firstHooks[0].inFlight).toEqual(['message:sending']);
 
-      // The worker, mid-handler, issues a capability that re-fires message:sending on the host.
-      ch.reply({ kind: 'cap', id: 99, verb: 'messages.sendText', args: ['s1', 'c1', 'hi'] });
+      // The worker, mid-handler, issues a capability that re-fires message:sending on the host. A call
+      // made inside a hook handler echoes that dispatch's chain (WorkerCapabilityClient does this).
+      ch.reply({
+        kind: 'cap',
+        id: 99,
+        verb: 'messages.sendText',
+        args: ['s1', 'c1', 'hi'],
+        inFlight: firstHooks[0].inFlight,
+      });
       await flush();
       await flush();
 
@@ -524,6 +743,78 @@ describe('PluginWorkerHost', () => {
       // The worker completes the original hook; the chain resolves normally.
       ch.reply({ kind: 'hook-result', id: hookId, continue: true });
       await expect(exec).resolves.toEqual({ continue: true, data: { n: 1 } });
+    });
+  });
+
+  describe('hook re-entrancy guard is scoped to the causal chain, not the worker', () => {
+    const flush = (): Promise<void> => new Promise(resolve => setImmediate(resolve));
+    const SENDING = 'message:sending' as HookEvent;
+
+    // A worker with a message:sending dispatch still pending, plus an in-process moderation hook that
+    // vetoes every send. The cap dispatcher reports what the veto chain decided for its send.
+    const setup = (pendingEvent = 'message:sending') => {
+      const hm = new HookManager();
+      const ch = new FakeChannel();
+      hm.register('moderation', SENDING, () => Promise.resolve({ continue: false }));
+      const capDispatcher = async (): Promise<unknown> => (await hm.execute(SENDING, {}, { source: 'cap' })).continue;
+      const host = new PluginWorkerHost(ch, capDispatcher, undefined, undefined, undefined, (events, run) =>
+        hm.runInFlight(events as HookEvent[], run),
+      );
+      void host.dispatchHook({ event: pendingEvent, data: {}, source: 'test', timeoutMs: 60_000 });
+      const result = async (id: number): Promise<unknown> => {
+        await flush();
+        await flush();
+        const reply = ch.sent.find(m => m.kind === 'cap-result' && m.id === id);
+        return reply && reply.kind === 'cap-result' && reply.ok ? reply.result : reply;
+      };
+      return { ch, result };
+    };
+
+    it('a capability call outside any hook handler still runs every message:sending veto', async () => {
+      const { ch, result } = setup();
+      // e.g. an ingress handler sending while the worker's own message:sending hook is pending.
+      ch.reply({ kind: 'cap', id: 1, verb: 'messages.sendText', args: [] });
+      await expect(result(1)).resolves.toBe(false); // vetoed, not short-circuited to continue:true
+      ch.crash(); // drains the pending dispatch and its timer
+    });
+
+    it('a capability call carrying the pending dispatch chain is still short-circuited', async () => {
+      const { ch, result } = setup();
+      ch.reply({ kind: 'cap', id: 2, verb: 'messages.sendText', args: [], inFlight: ['message:sending'] });
+      await expect(result(2)).resolves.toBe(true);
+      ch.crash(); // drains the pending dispatch and its timer
+    });
+
+    it('ignores a claimed event the host never dispatched to this worker', async () => {
+      // Only message:sent is pending; the worker claims message:sending, the chain the send would skip.
+      const { ch, result } = setup('message:sent');
+      ch.reply({ kind: 'cap', id: 3, verb: 'messages.sendText', args: [], inFlight: ['message:sending'] });
+      await expect(result(3)).resolves.toBe(false);
+      ch.crash(); // drains the pending dispatch and its timer
+    });
+
+    it('forwards the host ancestor chain on the hook message and honours it on the way back', async () => {
+      const hm = new HookManager();
+      const ch = new FakeChannel();
+      hm.register('moderation', SENDING, () => Promise.resolve({ continue: false }));
+      const capDispatcher = async (): Promise<unknown> => (await hm.execute(SENDING, {}, { source: 'cap' })).continue;
+      const host = new PluginWorkerHost(ch, capDispatcher, undefined, undefined, undefined, (events, run) =>
+        hm.runInFlight(events as HookEvent[], run),
+      );
+      void host.dispatchHook({
+        event: 'message:sent',
+        data: {},
+        source: 'test',
+        inFlight: ['message:sending', 'message:sent'],
+        timeoutMs: 60_000,
+      });
+      const hook = ch.sent.find(m => m.kind === 'hook');
+      expect(hook && hook.kind === 'hook' && hook.inFlight).toEqual(['message:sending', 'message:sent']);
+      ch.reply({ kind: 'cap', id: 4, verb: 'messages.sendText', args: [], inFlight: ['message:sending'] });
+      await flush();
+      await flush();
+      expect(ch.sent).toContainEqual({ kind: 'cap-result', id: 4, ok: true, result: true });
+      ch.crash(); // drains the pending dispatch and its timer
     });
   });
 

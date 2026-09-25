@@ -8,6 +8,9 @@ import {
   GroupDescriptionDto,
   JoinGroupDto,
   GroupSettingsDto,
+  MembershipRequestActionDto,
+  SetGroupPictureDto,
+  GROUP_PARTICIPANTS_MAX,
 } from './group.dto';
 
 // Mirror the global ValidationPipe: whitelist + forbidNonWhitelisted from src/main.ts, AND the
@@ -26,6 +29,19 @@ function instanceFor<T extends object>(cls: new () => T, payload: unknown): T {
 }
 
 describe('group DTO validation', () => {
+  it('SetGroupPictureDto accepts only an absolute http(s) url, the only form the engines fetch', async () => {
+    for (const url of ['example.com/a.jpg', 'ftp://example.com/a.jpg']) {
+      expect((await errorsFor(SetGroupPictureDto, { url })).length).toBeGreaterThan(0);
+    }
+    for (const url of ['https://example.com/a.jpg', 'HTTPS://example.com/a.jpg', 'http://example.com/a.jpg']) {
+      expect(await errorsFor(SetGroupPictureDto, { url })).toHaveLength(0);
+    }
+    expect(await errorsFor(SetGroupPictureDto, { url: 'example.com/a.jpg', base64: 'QUJD' })).toHaveLength(0);
+    // A base64 that is only a data-URI prefix strips to nothing, so the url is what would be sent.
+    const prefixOnly = { url: 'cdn/group.jpg', base64: 'data:image/jpeg;base64,', mimetype: 'image/jpeg' };
+    expect((await errorsFor(SetGroupPictureDto, prefixOnly)).length).toBeGreaterThan(0);
+  });
+
   it('accepts a valid participants body (regression for #190)', async () => {
     const errors = await errorsFor(ParticipantsDto, { participants: ['628123456789@c.us'] });
     expect(errors).toHaveLength(0);
@@ -39,6 +55,20 @@ describe('group DTO validation', () => {
   it('rejects a non-array participants value', async () => {
     const errors = await errorsFor(ParticipantsDto, { participants: 'not-an-array' });
     expect(errors.length).toBeGreaterThan(0);
+  });
+
+  it('accepts a participants array at the batch cap (256)', async () => {
+    const participants = Array.from({ length: 256 }, (_, i) => `628100000${String(i).padStart(3, '0')}@c.us`);
+    expect(await errorsFor(ParticipantsDto, { participants })).toHaveLength(0);
+    expect(await errorsFor(CreateGroupDto, { name: 'G', participants })).toHaveLength(0);
+  });
+
+  it('rejects a participants array beyond the batch cap (the engine works the list sequentially)', async () => {
+    const participants = Array.from({ length: 257 }, (_, i) => `628100000${String(i).padStart(3, '0')}@c.us`);
+    const batchErrors = await errorsFor(ParticipantsDto, { participants });
+    expect(batchErrors.some(e => e.property === 'participants')).toBe(true);
+    const createErrors = await errorsFor(CreateGroupDto, { name: 'G', participants });
+    expect(createErrors.some(e => e.property === 'participants')).toBe(true);
   });
 
   it('still rejects unknown properties (forbidNonWhitelisted intact)', async () => {
@@ -120,5 +150,34 @@ describe('group DTO validation', () => {
   it('GroupSettingsDto still accepts a numeric-string ephemeralSeconds from a form body', () => {
     expect(instanceFor(GroupSettingsDto, { ephemeralSeconds: '86400' }).ephemeralSeconds).toBe(86400);
     expect(instanceFor(GroupSettingsDto, { ephemeralSeconds: '0' }).ephemeralSeconds).toBe(0);
+  });
+});
+
+/**
+ * The approve/reject body draws a sharp line between "omitted" (act on EVERY pending request) and
+ * every other shape. An explicit `null` and an empty array must fail validation rather than be
+ * read as approve-all — the explicit-null discipline of SetGroupPictureDto — because both are the
+ * classic malformed-client shapes, and misreading either mass-approves join requests.
+ */
+describe('MembershipRequestActionDto', () => {
+  it('accepts an empty body — approve/reject ALL pending', async () => {
+    expect(await errorsFor(MembershipRequestActionDto, {})).toHaveLength(0);
+  });
+
+  it('accepts a named requester list', async () => {
+    expect(await errorsFor(MembershipRequestActionDto, { participants: ['628123456789@c.us'] })).toHaveLength(0);
+  });
+
+  it('rejects an explicit null — malformed, not approve-all', async () => {
+    expect((await errorsFor(MembershipRequestActionDto, { participants: null })).length).toBeGreaterThan(0);
+  });
+
+  it('rejects an empty array — naming nobody is not the same claim as "all"', async () => {
+    expect((await errorsFor(MembershipRequestActionDto, { participants: [] })).length).toBeGreaterThan(0);
+  });
+
+  it('rejects a list beyond the shared participant cap', async () => {
+    const oversized = Array.from({ length: GROUP_PARTICIPANTS_MAX + 1 }, (_, i) => `62${i}@c.us`);
+    expect((await errorsFor(MembershipRequestActionDto, { participants: oversized })).length).toBeGreaterThan(0);
   });
 });

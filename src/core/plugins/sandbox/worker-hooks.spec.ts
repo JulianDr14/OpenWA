@@ -27,6 +27,33 @@ describe('WorkerHookRegistry', () => {
     expect(sent.filter(m => m.kind === 'hook-subscribe')).toHaveLength(1);
   });
 
+  it('re-subscribes when a later handler lowers the event priority, and only then', () => {
+    const { sent, post } = collect();
+    const reg = new WorkerHookRegistry(post);
+
+    reg.register('message:sending', () => Promise.resolve({ continue: true }), 200);
+    reg.register('message:sending', () => Promise.resolve({ continue: true }), 1);
+    reg.register('message:sending', () => Promise.resolve({ continue: true }), 300);
+
+    expect(sent.filter(m => m.kind === 'hook-subscribe')).toEqual([
+      { kind: 'hook-subscribe', event: 'message:sending', priority: 200 },
+      { kind: 'hook-subscribe', event: 'message:sending', priority: 1 },
+    ]);
+  });
+
+  it('compares a later priority against the default when the first one is not a finite number', () => {
+    const { sent, post } = collect();
+    const reg = new WorkerHookRegistry(post);
+
+    reg.register('message:sending', () => Promise.resolve({ continue: true }), 'abc');
+    reg.register('message:sending', () => Promise.resolve({ continue: true }), 1);
+
+    expect(sent.filter(m => m.kind === 'hook-subscribe')).toEqual([
+      { kind: 'hook-subscribe', event: 'message:sending', priority: 100 },
+      { kind: 'hook-subscribe', event: 'message:sending', priority: 1 },
+    ]);
+  });
+
   it('runs the handler on a hook and replies with continue + modified data', async () => {
     const { sent, post } = collect();
     const reg = new WorkerHookRegistry(post);
@@ -51,6 +78,22 @@ describe('WorkerHookRegistry', () => {
     expect(sent.find(m => m.kind === 'hook-result')).toMatchObject({ continue: false, data: { n: 2 } });
   });
 
+  it('skips a later handler result the event cannot use, keeping an earlier rewrite', async () => {
+    const { sent, post } = collect();
+    const reg = new WorkerHookRegistry(post);
+    reg.register(
+      'message:received',
+      ctx => Promise.resolve({ continue: true, data: { ...(ctx.data as object), body: '[redacted]' } }),
+      10,
+    );
+    reg.register('message:received', () => Promise.resolve({ continue: true, data: null }), 100);
+
+    const message = { id: 'm1', chatId: 'c@c.us', body: 'secret' };
+    await reg.handleHook({ kind: 'hook', id: 5, event: 'message:received', data: message, source: 'Engine' });
+
+    expect(sent.find(m => m.kind === 'hook-result')).toMatchObject({ data: { ...message, body: '[redacted]' } });
+  });
+
   it('a throwing handler does not break the chain', async () => {
     const { sent, post } = collect();
     const reg = new WorkerHookRegistry(post);
@@ -59,5 +102,29 @@ describe('WorkerHookRegistry', () => {
     await reg.handleHook({ kind: 'hook', id: 1, event: 'e', data: { x: 1 }, source: 's' });
 
     expect(sent.find(m => m.kind === 'hook-result')).toMatchObject({ continue: true });
+  });
+
+  it('reports a throwing handler to the host on the hook-result (later handlers still run)', async () => {
+    const { sent, post } = collect();
+    const reg = new WorkerHookRegistry(post);
+    reg.register('e', () => Promise.reject(new Error('boom')), 10);
+    reg.register('e', () => Promise.resolve({ continue: true, data: { n: 2 } }), 20);
+
+    await reg.handleHook({ kind: 'hook', id: 1, event: 'e', data: { x: 1 }, source: 's' });
+
+    // The error rides the result so the host can surface it; the chain's fail-open shape is unchanged.
+    expect(sent.find(m => m.kind === 'hook-result')).toMatchObject({ continue: true, data: { n: 2 }, error: 'boom' });
+  });
+
+  it('reports only the FIRST handler error and stringifies non-Error throws', async () => {
+    const { sent, post } = collect();
+    const reg = new WorkerHookRegistry(post);
+    // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- a non-Error rejection is exactly the case under test (it must be stringified, not crash the wire)
+    reg.register('e', () => Promise.reject('string failure'), 10);
+    reg.register('e', () => Promise.reject(new Error('second')), 20);
+
+    await reg.handleHook({ kind: 'hook', id: 1, event: 'e', data: {}, source: 's' });
+
+    expect(sent.find(m => m.kind === 'hook-result')).toMatchObject({ continue: true, error: 'string failure' });
   });
 });

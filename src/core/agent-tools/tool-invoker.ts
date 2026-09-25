@@ -1,7 +1,7 @@
 import { BadRequestException, ForbiddenException, UnauthorizedException } from '@nestjs/common';
 import { ZodError } from 'zod';
 import type { AuthService } from '../../modules/auth/auth.service';
-import type { ToolDescriptor } from './tool-descriptor';
+import type { AnyToolDescriptor } from './tool-descriptor';
 
 /**
  * Run one tool call with REST-equivalent guarantees, reusing core's own auth:
@@ -21,7 +21,7 @@ import type { ToolDescriptor } from './tool-descriptor';
  * thrown from a handler body is NOT surfaced here. Re-thrown after the callback.
  */
 export async function invokeTool(
-  tool: ToolDescriptor,
+  tool: AnyToolDescriptor,
   rawInput: unknown,
   rawKey: string | undefined,
   authService: AuthService,
@@ -54,6 +54,13 @@ export async function invokeTool(
     if (tool.requiredRole && !authService.hasPermission(apiKey, tool.requiredRole)) {
       throw new ForbiddenException('API key lacks the required role');
     }
+
+    // A chat-restricted key cannot be filtered on the tool surface yet (chat-scoped tool arguments
+    // are handled in the follow-up slice), so refuse it outright rather than let a tool act on any
+    // chat. Mirrors the REST guard's default-deny for unmarked routes.
+    if ((apiKey.allowedChats?.length ?? 0) > 0) {
+      throw new ForbiddenException('API key is restricted to selected chats');
+    }
   } catch (error) {
     // auditMcpAuthFailure (the only current caller hook) filters to 401/403, so the BadRequestException
     // for a missing sessionId above is NOT audited (parity with the REST guard, which skips 400s).
@@ -71,5 +78,7 @@ export async function invokeTool(
     }
     throw e;
   }
-  return tool.handler(input, apiKey);
+  // The single cast the erasure needs, placed next to the parse that justifies it: `input` is
+  // whatever this tool's own `inputSchema` just accepted, which is exactly what its handler declares.
+  return tool.handler(input as never, apiKey);
 }

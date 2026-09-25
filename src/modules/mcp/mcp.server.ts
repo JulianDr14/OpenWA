@@ -1,6 +1,7 @@
 import { ForbiddenException, HttpException, Logger, UnauthorizedException } from '@nestjs/common';
 import type { HttpAdapterHost } from '@nestjs/core';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { AnySchema } from '@modelcontextprotocol/sdk/server/zod-compat.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
 import type { ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js';
@@ -12,7 +13,9 @@ import type { AuditService } from '../audit/audit.service';
 import { AuditAction } from '../audit/entities/audit-log.entity';
 import { handleToolError, jsonToolResult, smartToolResult } from './tool-result';
 import type { KeyRateLimiter } from './mcp-rate-limit';
-import { resolveClientIp } from '../../common/utils/ip';
+import { limiterKeyForIp, resolveClientIp } from '../../common/utils/ip';
+import { resolveBodyLimit } from '../../config/bootstrap-security';
+import { bearerToken } from '../../common/security/bearer-token';
 
 const logger = new Logger('McpServer');
 
@@ -34,11 +37,7 @@ function extractApiKey(extra: ToolExtra): string | undefined {
     return Array.isArray(xApiKey) ? xApiKey[0] : xApiKey;
   }
   const auth = headers['authorization'];
-  const authStr = Array.isArray(auth) ? auth[0] : auth;
-  if (authStr?.toLowerCase().startsWith('bearer ')) {
-    return authStr.slice(7).trim();
-  }
-  return undefined;
+  return bearerToken(Array.isArray(auth) ? auth[0] : auth);
 }
 
 /**
@@ -106,8 +105,10 @@ function buildServer(
       tool.name,
       {
         description: tool.description,
-        // inputSchema accepts AnySchema (zod v4 $ZodType is compatible)
-        inputSchema: tool.inputSchema as Parameters<typeof server.registerTool>[1]['inputSchema'],
+        // The SDK's InputArgs is inferred from this property. Widening it to the whole
+        // `ZodRawShapeCompat | AnySchema` constraint would collapse the callback type it derives, so
+        // the cast names AnySchema exactly — which zod v4's $ZodType satisfies.
+        inputSchema: tool.inputSchema as AnySchema,
         annotations: {
           readOnlyHint: tool.tier === 'read',
           destructiveHint: tool.destructive ?? false,
@@ -155,7 +156,7 @@ export interface MountMcpServerOptions {
  *
  * Tool handlers are built ONCE at mount time (closure over registry/authService/rateLimiter).
  * Per-request: mint a fresh McpServer + StreamableHTTPServerTransport, handle, tear down.
- * Stateless (sessionIdGenerator: undefined) — no session map, no GET/DELETE reconnect.
+ * Stateless (sessionIdGenerator: undefined): no session map; GET/DELETE answer 405.
  * Creating a new McpServer per request is safe and avoids the single-transport constraint;
  * tool registration is O(n) pure function calls with no I/O overhead.
  */
@@ -167,9 +168,14 @@ export interface MountMcpServerOptions {
  */
 export function createIpThrottle(ipRateLimiter: KeyRateLimiter): RequestHandler {
   return (req, res, next) => {
-    const ip = resolveClientIp(req, readTrustedProxies());
+    const ip = limiterKeyForIp(resolveClientIp(req, readTrustedProxies()));
+    // The unit of work is the JSON-RPC message, not the HTTP request: the transport dispatches every
+    // element of a batch, and each tools/call element runs its own key lookup and auth-failure audit.
+    // An over-budget batch throws on the first check past the cap, so a huge array costs at most
+    // `max + 1` checks.
+    const messages = Array.isArray(req.body) ? Math.max(1, req.body.length) : 1;
     try {
-      ipRateLimiter.check(ip);
+      for (let i = 0; i < messages; i++) ipRateLimiter.check(ip);
       next();
     } catch (err) {
       const status = err instanceof HttpException ? err.getStatus() : 429;
@@ -237,9 +243,29 @@ export function mountMcpServer(
     }
   };
 
-  const adapter = httpAdapter as unknown as { post: (path: string, ...handlers: RequestHandler[]) => unknown };
+  type Mount = (path: string, ...handlers: RequestHandler[]) => unknown;
+  const adapter = httpAdapter as unknown as { post: Mount; get: Mount; delete: Mount };
   // The route throttle gates the auth DB lookup and per-request MCP server/transport construction. The
   // process-wide capped json() in main.ts runs first for all routes; this route-level parser is a
-  // defensive fallback and no-ops once the global parser has consumed the body.
-  adapter.post(basePath, createIpThrottle(ipRateLimiter), express.json(), handler);
+  // defensive fallback and no-ops once the global parser has consumed the body. It sits before the
+  // throttle so the throttle always sees a parsed body and can charge a batch per message.
+  // `inflate: false` matches the global parsers: a compressed body is refused by the budget
+  // middleware long before this runs, and this keeps the fallback from becoming the one parser that
+  // would still gunzip an unaccounted body if that ordering ever changed.
+  // `limit` mirrors the same global cap for the same reason: without it a middleware reorder would
+  // silently leave this mount uncapped.
+  const bodyLimit = resolveBodyLimit(process.env.BODY_SIZE_LIMIT);
+  adapter.post(basePath, express.json({ limit: bodyLimit, inflate: false }), createIpThrottle(ipRateLimiter), handler);
+  // Stateless transport: no standalone SSE stream and no session to delete. The Streamable HTTP spec
+  // requires a GET to be answered with a stream or 405, and SDK clients treat anything but 405 as an
+  // error on every connect. Routing these to the transport would open a stream (GET) or answer 200
+  // (DELETE), so they are refused here without touching auth or the DB.
+  const methodNotAllowed: RequestHandler = (_req, res) => {
+    res
+      .status(405)
+      .set('Allow', 'POST')
+      .json({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed.' }, id: null });
+  };
+  adapter.get(basePath, methodNotAllowed);
+  adapter.delete(basePath, methodNotAllowed);
 }
