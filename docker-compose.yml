@@ -46,7 +46,7 @@ services:
   # ===== CORE: OpenWA Backend API =====
   openwa-api:
     # Prebuilt upstream image: no build on the Dokploy host. Bump the tag to upgrade.
-    image: rmyndharis/openwa:0.23.7
+    image: rmyndharis/openwa:0.30.3
     container_name: openwa-api
     restart: unless-stopped
     # Give the ordered teardown room to finish before Docker SIGKILLs the container, which would cut
