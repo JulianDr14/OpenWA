@@ -49,7 +49,15 @@ export class ConversationMappingService implements PluginConversationMappingPort
     }
     try {
       const handoverState = await this.inheritedHandover(key);
-      await this.repo.save(this.repo.create({ ...key, providerConversationId, handoverState, ...patch }));
+      // A bare INSERT, not save(): save() wraps it in a transaction, and on SQLite's single shared
+      // connection the rollback of the unique violation handled below would also discard any other
+      // write made while it was open.
+      await this.repo.insert({
+        ...key,
+        providerConversationId,
+        handoverState,
+        ...patch,
+      } as QueryDeepPartialEntity<ConversationMapping>);
       // A hand-back on the other form between the read above and this insert did not reach the new row;
       // read again now that the row exists (a later decision updates it directly).
       if (!patch?.handoverState && handoverState !== 'bot') {
@@ -87,6 +95,14 @@ export class ConversationMappingService implements PluginConversationMappingPort
       if (isUniqueViolation(err)) throw new ConversationMappingConflict(key, providerConversationId);
       throw err;
     }
+  }
+
+  /**
+   * A takeover is scoped to the chat, not to the plugin, and silences every other plugin there. The
+   * mappings stay, so a plugin installed again keeps its provider conversations; only the takeovers go.
+   */
+  async releaseTakeovers(pluginId: string): Promise<void> {
+    await this.repo.update({ pluginId, handoverState: In(['human', 'closed']) }, { handoverState: 'bot' });
   }
 
   get(key: MappingKey): Promise<ConversationMapping | null> {
@@ -152,6 +168,32 @@ export class ConversationMappingService implements PluginConversationMappingPort
     return this.repo.findOne({ where: { pluginId, instanceId, providerConversationId } });
   }
 
+  /**
+   * Effective handover held by this plugin instance across every known ID form (`lid` and phone) of
+   * the row's chat: `human` outranks `closed`, which outranks `bot`, matching how the dispatch gate
+   * resolves split pre-pairing rows. Other plugins, instances, and sessions are excluded, and a
+   * `human` row returns immediately without alias or repository lookups.
+   */
+  async effectiveHandover(
+    row: Pick<ConversationMapping, 'sessionId' | 'chatId' | 'pluginId' | 'instanceId' | 'handoverState'>,
+  ): Promise<HandoverState> {
+    if (row.handoverState === 'human') return 'human';
+    const others = (await this.chatIdAliases(row.chatId)).filter(id => id !== row.chatId);
+    if (!others.length) return row.handoverState;
+    const siblings = await this.repo.find({
+      where: {
+        sessionId: row.sessionId,
+        pluginId: row.pluginId,
+        instanceId: row.instanceId,
+        chatId: In(others),
+      },
+    });
+    const states = [row.handoverState, ...siblings.map(s => s.handoverState)];
+    if (states.includes('human')) return 'human';
+    if (states.includes('closed')) return 'closed';
+    return 'bot';
+  }
+
   // A handover decision is about the chat, not one id form of it: it is written to every row this plugin
   // instance holds for the chat in the session, so a later write to one form (an idempotent upsert)
   // cannot revive or drop the decision through the other. A row rebound from a deleted session keeps
@@ -165,6 +207,11 @@ export class ConversationMappingService implements PluginConversationMappingPort
     await this.repo.update({ sessionId, pluginId, instanceId, chatId }, { handoverState: state });
   }
 
+  /** Remove a mapping row by id — the supersede half of the stale-session repair path. */
+  async delete(id: string): Promise<void> {
+    await this.repo.delete({ id });
+  }
+
   /**
    * Rebind a mapping whose session was deleted (and re-paired under a new id) onto the caller's
    * current session, so the stale row stops failing every reverse-key resolution. If the current
@@ -173,11 +220,6 @@ export class ConversationMappingService implements PluginConversationMappingPort
    * row already owns its reverse key). That existing row is the fresher binding for the same chat,
    * so the stale row is superseded by deleting it instead.
    */
-  /** Remove a mapping row by id — the supersede half of the stale-session repair path. */
-  async delete(id: string): Promise<void> {
-    await this.repo.delete({ id });
-  }
-
   async rebindSession(id: string, sessionId: string): Promise<void> {
     try {
       await this.repo.update({ id }, { sessionId });
