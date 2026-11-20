@@ -2,6 +2,7 @@ import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { IsArray, IsObject, IsString, IsUrl } from 'class-validator';
 import type { PluginConfigSchema, PluginI18n } from '../../../core/plugins';
 import { PluginType, PluginStatus } from '../../../core/plugins';
+import { ToStrictArray, ToStrictString } from '../../../common/utils/strict-boolean';
 
 export class PluginDto {
   @ApiProperty({ description: 'Plugin ID' })
@@ -77,6 +78,7 @@ export class PluginSessionsDto {
     example: ['*'],
     type: [String],
   })
+  @ToStrictArray()
   @IsArray()
   @IsString({ each: true })
   sessions!: string[];
@@ -94,8 +96,14 @@ export class InstallFromUrlDto {
       'params are ignored) — because the package is executable code and must be integrity-protected in ' +
       'transit. A pinned digest that does not match the downloaded archive fails the install.',
   })
+  @ToStrictString()
   @IsString()
-  @IsUrl({ protocols: ['http', 'https'], require_protocol: true }, { message: 'url must be an absolute http(s) URL' })
+  // require_tld:false + allow_underscores:true so single-label hosts (a compose service, `localhost`) reach
+  // the SSRF guard, which admits them only when SSRF_ALLOWED_HOSTS names them.
+  @IsUrl(
+    { protocols: ['http', 'https'], require_protocol: true, require_tld: false, allow_underscores: true },
+    { message: 'url must be an absolute http(s) URL' },
+  )
   url!: string;
 }
 

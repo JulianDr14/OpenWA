@@ -1,16 +1,18 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { FindOperator, In, Repository } from 'typeorm';
+import { Readable } from 'stream';
 import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { MessageService, spendInlineMediaBudget } from './message.service';
 import { MessageSendService } from './message-send.service';
-import { Message, MessageDirection } from './entities/message.entity';
+import { Message } from './entities/message.entity';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import { MessageProjector } from '../session/message-projector.service';
 import type { IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.interface';
 import { HookManager } from '../../core/hooks';
 import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
 import { LidMapping } from '../../engine/identity/lid-mapping.entity';
+import { rememberChatOfPage } from '../../engine/identity/wa-id';
 import { SendPacingService } from './send-pacing.service';
 
 /** The `In([...])` condition a lid-table fake honours; an absent condition matches every row. */
@@ -25,10 +27,36 @@ const inertPacing = (): SendPacingService =>
     recordSendSuccess: jest.fn(),
   }) as unknown as SendPacingService;
 
+/**
+ * Completes a query-builder fake with the list read getMessages performs: a count, the page as
+ * id/length pairs, then the rows themselves by id. `rows` answers with what the fake's filters match.
+ */
+function withListRead<T extends object>(qb: T, repository: Partial<Repository<Message>>, rows: () => Message[]): T {
+  Object.assign(qb, {
+    select: jest.fn().mockReturnValue(qb),
+    addSelect: jest.fn().mockReturnValue(qb),
+    clone: jest.fn().mockReturnValue(qb),
+    getMany: jest.fn().mockImplementation(() => Promise.resolve(rows())),
+    getCount: jest.fn().mockImplementation(() => Promise.resolve(rows().length)),
+    getRawMany: jest
+      .fn()
+      .mockImplementation(() =>
+        Promise.resolve(rows().map(r => ({ id: r.id, metadataLength: JSON.stringify(r.metadata ?? null).length }))),
+      ),
+  });
+  repository.find = jest
+    .fn()
+    .mockImplementation(({ where }: { where: { id: FindOperator<string> } }) =>
+      Promise.resolve(rows().filter(r => inList(r.id, where.id))),
+    );
+  return qb;
+}
+
 function createMockEngine() {
   return {
     reactToMessage: jest.fn().mockResolvedValue(undefined),
     getMessageReactions: jest.fn().mockResolvedValue([]),
+    getMessageReceipts: jest.fn().mockResolvedValue({ delivery: [], read: [], played: [] }),
     deleteMessage: jest.fn().mockResolvedValue(undefined),
     pinMessage: jest.fn().mockResolvedValue(undefined),
     starMessage: jest.fn().mockResolvedValue(undefined),
@@ -43,16 +71,23 @@ describe('MessageService', () => {
   let service: MessageService;
   let repository: jest.Mocked<Partial<Repository<Message>>>;
   let engines: EngineRegistry;
-  let messageProjector: { recordOutboundMessageEdit: jest.Mock };
+  let messageProjector: { recordOutboundMessageEdit: jest.Mock; recordRevoke: jest.Mock };
   let hookManager: jest.Mocked<Partial<HookManager>>;
-  let lidMappingStore: { findLidsForPhone: jest.Mock; findPhoneForLid: jest.Mock };
+  let lidMappingStore: {
+    findLidsForPhone: jest.Mock;
+    findPhoneForLid: jest.Mock;
+    lidsForPhonesPersisted: jest.Mock;
+    phonesForLidsPersisted: jest.Mock;
+  };
   let mockEngine: ReturnType<typeof createMockEngine>;
+  let pacing: { assertSendAllowed: jest.Mock };
 
   beforeEach(async () => {
     repository = {
       create: jest.fn().mockImplementation((data: Partial<Message>) => ({ id: 'msg-uuid-1', ...data }) as Message),
       save: jest.fn().mockImplementation(msg => Promise.resolve(msg)),
       findOne: jest.fn().mockResolvedValue(null),
+      find: jest.fn().mockResolvedValue([]),
       update: jest.fn().mockResolvedValue({ affected: 1 }),
       delete: jest.fn().mockResolvedValue({ affected: 1 }),
       createQueryBuilder: jest.fn(),
@@ -60,7 +95,10 @@ describe('MessageService', () => {
 
     mockEngine = createMockEngine();
 
-    messageProjector = { recordOutboundMessageEdit: jest.fn().mockResolvedValue(undefined) };
+    messageProjector = {
+      recordOutboundMessageEdit: jest.fn().mockResolvedValue(undefined),
+      recordRevoke: jest.fn().mockResolvedValue(undefined),
+    };
 
     engines = new EngineRegistry();
     engines.set('sess-1', mockEngine as unknown as IWhatsAppEngine);
@@ -76,6 +114,8 @@ describe('MessageService', () => {
     lidMappingStore = {
       findLidsForPhone: jest.fn().mockResolvedValue([]),
       findPhoneForLid: jest.fn().mockResolvedValue(null),
+      lidsForPhonesPersisted: jest.fn().mockResolvedValue({}),
+      phonesForLidsPersisted: jest.fn().mockResolvedValue({}),
     };
 
     const module: TestingModule = await Test.createTestingModule({
@@ -101,6 +141,7 @@ describe('MessageService', () => {
     }).compile();
 
     service = module.get<MessageService>(MessageService);
+    pacing = module.get(SendPacingService);
   });
 
   // ── outbound send delegation ──────────────────────────────────────
@@ -156,7 +197,6 @@ describe('MessageService', () => {
       skip: jest.Mock;
       take: jest.Mock;
       andWhere: jest.Mock;
-      getManyAndCount: jest.Mock;
     }
     const makeQb = (): QbMock => {
       const qb: QbMock = {
@@ -166,7 +206,6 @@ describe('MessageService', () => {
         skip: jest.fn(),
         take: jest.fn(),
         andWhere: jest.fn(),
-        getManyAndCount: jest.fn().mockResolvedValue([[], 0]),
       };
       qb.where.mockReturnValue(qb);
       qb.orderBy.mockReturnValue(qb);
@@ -174,7 +213,7 @@ describe('MessageService', () => {
       qb.skip.mockReturnValue(qb);
       qb.take.mockReturnValue(qb);
       qb.andWhere.mockReturnValue(qb);
-      return qb;
+      return withListRead(qb, repository, () => []);
     };
 
     it('falls back to defaults on NaN limit/offset (never take(NaN))', async () => {
@@ -192,26 +231,33 @@ describe('MessageService', () => {
       expect(qb.take).toHaveBeenCalledWith(100);
       expect(qb.skip).toHaveBeenCalledWith(0);
     });
+
+    it('caps an offset past the largest safe integer, which a driver would refuse as an OFFSET', async () => {
+      const qb = makeQb();
+      (repository.createQueryBuilder as jest.Mock).mockReturnValue(qb);
+      await service.getMessages('sess-1', { offset: 2 ** 63 });
+      expect(qb.skip).toHaveBeenCalledWith(Number.MAX_SAFE_INTEGER);
+    });
   });
 
   // ── getMessages keyset cursor ─────────────────────────────────────
 
   describe('getMessages anchors on `after` instead of a count', () => {
-    /** The cursor path clones for the count and reads rows separately, so getManyAndCount is unused. */
+    /** The cursor path counts the whole filter match (7 here), then reads the page after the anchor. */
     const makeCursorQb = (rows: Message[]) => {
-      const qb = {
-        where: jest.fn().mockReturnThis(),
-        orderBy: jest.fn().mockReturnThis(),
-        addOrderBy: jest.fn().mockReturnThis(),
-        skip: jest.fn().mockReturnThis(),
-        take: jest.fn().mockReturnThis(),
-        andWhere: jest.fn().mockReturnThis(),
-        clone: jest.fn(),
-        getCount: jest.fn().mockResolvedValue(7),
-        getMany: jest.fn().mockResolvedValue(rows),
-        getManyAndCount: jest.fn(),
-      };
-      qb.clone.mockReturnValue(qb);
+      const qb = withListRead(
+        {
+          where: jest.fn().mockReturnThis(),
+          orderBy: jest.fn().mockReturnThis(),
+          addOrderBy: jest.fn().mockReturnThis(),
+          skip: jest.fn().mockReturnThis(),
+          take: jest.fn().mockReturnThis(),
+          andWhere: jest.fn().mockReturnThis(),
+        },
+        repository,
+        () => rows,
+      ) as unknown as Record<string, jest.Mock>;
+      qb.getCount.mockResolvedValue(7);
       return qb;
     };
 
@@ -221,8 +267,7 @@ describe('MessageService', () => {
 
       const result = await service.getMessages('sess-1', { after: 'm-1', offset: 500 });
 
-      expect(qb.skip).not.toHaveBeenCalled();
-      expect(qb.getManyAndCount).not.toHaveBeenCalled();
+      expect(qb.skip.mock.calls.every(([value]) => value === undefined)).toBe(true);
       const [clause, params] = qb.andWhere.mock.calls[0] as [string, Record<string, unknown>];
       // rowid, not id: the stub repository carries no manager, which reads as "not postgres".
       expect(clause).toContain('(message.createdAt, message.rowid) <');
@@ -254,6 +299,36 @@ describe('MessageService', () => {
       expect(qb.addOrderBy).toHaveBeenCalledWith('message.id', 'DESC');
 
       delete (repository as unknown as { manager?: unknown }).manager;
+    });
+
+    /**
+     * The unary `+` sort key is SQLite-only. PostgreSQL has no unary `+` for timestamps, and TypeORM
+     * leaves the bare `message.createdAt` after it unquoted, so a chat page there would 500.
+     */
+    it('keeps the plain createdAt key for a multi-candidate chat on postgres', async () => {
+      const qb = makeCursorQb([{ id: 'm-2' } as Message]);
+      (repository.createQueryBuilder as jest.Mock).mockReturnValue(qb);
+      (repository as unknown as { manager: unknown }).manager = {
+        connection: { options: { type: 'postgres' } },
+      };
+
+      await service.getMessages('sess-1', { chatId: '628123@c.us' });
+
+      expect(qb.orderBy).toHaveBeenCalledWith('message.createdAt', 'DESC');
+      expect(qb.orderBy).not.toHaveBeenCalledWith('+message.createdAt', 'DESC');
+
+      delete (repository as unknown as { manager?: unknown }).manager;
+    });
+
+    it('takes createdAt out of index order for a multi-candidate chat on sqlite only', async () => {
+      const qb = makeCursorQb([{ id: 'm-2' } as Message]);
+      (repository.createQueryBuilder as jest.Mock).mockReturnValue(qb);
+
+      await service.getMessages('sess-1', { chatId: '628123@c.us' });
+      expect(qb.orderBy).toHaveBeenLastCalledWith('+message.createdAt', 'DESC');
+
+      await service.getMessages('sess-1', { chatId: '120363@g.us' });
+      expect(qb.orderBy).toHaveBeenLastCalledWith('message.createdAt', 'DESC');
     });
 
     it('orders by rowid on sqlite, which is the arrival order and needs no sort', async () => {
@@ -309,17 +384,14 @@ describe('MessageService', () => {
             if (params?.authorFroms) authorFroms = params.authorFroms;
             return qb;
           }),
-        getManyAndCount: jest.fn().mockImplementation(() => {
-          const matched =
-            froms || authorFroms
-              ? rows.filter(
-                  r => froms?.includes(r.from) || (r.author != null && (authorFroms?.includes(r.author) ?? false)),
-                )
-              : rows;
-          return Promise.resolve([matched, matched.length]);
-        }),
       };
-      return qb;
+      return withListRead(qb, repository, () =>
+        froms || authorFroms
+          ? rows.filter(
+              r => froms?.includes(r.from) || (r.author != null && (authorFroms?.includes(r.author) ?? false)),
+            )
+          : rows,
+      );
     };
 
     it('returns the lid-authored message once the table maps the lid to that phone (the hit)', async () => {
@@ -333,33 +405,36 @@ describe('MessageService', () => {
       expect(messages.map(m => m.id).sort()).toEqual(['m-dm', 'm-lid']);
     });
 
-    it('finds the lid-authored message through a real store whose cache no longer holds the lid', async () => {
-      // The mapping is only in the table: past the preload cap or evicted by the LRU.
-      const table = [{ lid: '111', phone: '628999' }];
-      const store = new LidMappingStoreService({
-        find: ({ where }: { where: { lid?: FindOperator<string>; phone?: FindOperator<string> } }) =>
-          Promise.resolve(table.filter(r => inList(r.lid, where.lid) && inList(r.phone, where.phone))),
-      } as unknown as Repository<LidMapping>);
-      const qb = makeFilteringQb();
-      (repository.createQueryBuilder as jest.Mock).mockReturnValue(qb);
-      const withStore = new MessageService(
-        repository as Repository<Message>,
-        engines,
-        messageProjector as unknown as MessageProjector,
-        hookManager as HookManager,
-        store,
-        inertPacing(),
-        {} as MessageSendService,
-      );
+    it.each([true, false])(
+      'uses table origin for a phone filter with an empty cache (reported=%s)',
+      async isReported => {
+        // The mapping is only in the table: past the preload cap or evicted by the LRU.
+        const table = [{ lid: '111', phone: '628999', isReported }];
+        const store = new LidMappingStoreService({
+          find: ({ where }: { where: { lid?: FindOperator<string>; phone?: FindOperator<string> } }) =>
+            Promise.resolve(table.filter(r => inList(r.lid, where.lid) && inList(r.phone, where.phone))),
+        } as unknown as Repository<LidMapping>);
+        const qb = makeFilteringQb();
+        (repository.createQueryBuilder as jest.Mock).mockReturnValue(qb);
+        const withStore = new MessageService(
+          repository as Repository<Message>,
+          engines,
+          messageProjector as unknown as MessageProjector,
+          hookManager as HookManager,
+          store,
+          inertPacing(),
+          {} as MessageSendService,
+        );
 
-      const { messages } = await withStore.getMessages('sess-1', { from: '628999' });
+        const { messages } = await withStore.getMessages('sess-1', { from: '628999' });
 
-      expect(store.lidsForPhone('628999')).toEqual([]);
-      expect(messages.map(m => m.id).sort()).toEqual(['m-dm', 'm-lid']);
-    });
+        expect(store.lidsForPhone('628999')).toEqual([]);
+        expect(messages.map(m => m.id).sort()).toEqual(isReported ? ['m-dm', 'm-lid'] : ['m-dm']);
+      },
+    );
 
-    it('finds the phone-form message for a @lid filter through a real store whose cache lacks the lid', async () => {
-      const table = [{ lid: '111', phone: '628999' }];
+    it.each([true, false])('uses table origin for a LID filter with an empty cache (reported=%s)', async isReported => {
+      const table = [{ lid: '111', phone: '628999', isReported }];
       const store = new LidMappingStoreService({
         findOne: ({ where }: { where: { lid: string } }) =>
           Promise.resolve(table.find(r => r.lid === where.lid) ?? null),
@@ -378,7 +453,7 @@ describe('MessageService', () => {
 
       const { messages } = await withStore.getMessages('sess-1', { from: '111@lid' });
 
-      expect(messages.map(m => m.id).sort()).toEqual(['m-dm', 'm-lid']);
+      expect(messages.map(m => m.id).sort()).toEqual(isReported ? ['m-dm', 'm-lid'] : ['m-lid']);
     });
 
     it('misses the lid-authored message when the table has no mapping (the prior silent miss)', async () => {
@@ -436,18 +511,17 @@ describe('MessageService', () => {
               return qb;
             },
           ),
-        getManyAndCount: jest.fn().mockImplementation(() => {
-          let matched = rows;
-          if (chatIds) matched = matched.filter(r => chatIds!.includes(r.chatId));
-          if (froms || authorFroms) {
-            matched = matched.filter(
-              r => froms?.includes(r.from) || (r.author != null && (authorFroms?.includes(r.author) ?? false)),
-            );
-          }
-          return Promise.resolve([matched, matched.length]);
-        }),
       };
-      return qb;
+      return withListRead(qb, repository, () => {
+        let matched = rows;
+        if (chatIds) matched = matched.filter(r => chatIds!.includes(r.chatId));
+        if (froms || authorFroms) {
+          matched = matched.filter(
+            r => froms?.includes(r.from) || (r.author != null && (authorFroms?.includes(r.author) ?? false)),
+          );
+        }
+        return matched;
+      });
     };
 
     it('returns group messages authored by the filtered phone (matched via author, not from)', async () => {
@@ -505,16 +579,15 @@ describe('MessageService', () => {
               return qb;
             },
           ),
-        getManyAndCount: jest.fn().mockResolvedValue([[], 0]),
       };
-      return { qb, captured };
+      return { qb: withListRead(qb, repository, () => []), captured };
     };
 
     it('expands a @lid chatId to the phone the table names, not a stale cached one', async () => {
       // This node cached lid 111 -> 628999; another node has since re-mapped it to 628777 in the
       // shared table. The chat fence reads the table, so history must expand to the same phone or a
       // key allowed only 111@lid would read chat 628999.
-      const table = [{ lid: '111', phone: '628999' }];
+      const table = [{ lid: '111', phone: '628999', isReported: true }];
       const store = new LidMappingStoreService({
         find: ({ where }: { where: { lid?: FindOperator<string>; phone?: FindOperator<string> } }) =>
           Promise.resolve(table.filter(r => inList(r.lid, where.lid) && inList(r.phone, where.phone))),
@@ -574,7 +647,8 @@ describe('MessageService', () => {
       await service.getMessages('sess-1', { from: '111@lid' });
 
       expect(lidMappingStore.findPhoneForLid).toHaveBeenCalledWith('111');
-      expect(captured.froms).toEqual(['111@lid', '628999@c.us', '628999@s.whatsapp.net']);
+      // The bare digits match an API send an earlier version stored with the account's phone as its sender.
+      expect(captured.froms).toEqual(['111@lid', '628999@c.us', '628999@s.whatsapp.net', '628999']);
       expect(captured.authorFroms).toEqual(captured.froms); // same candidates drive the author match
       expect(captured.froms).not.toContain('111@c.us'); // the lid's digits are not a phone
       expect(lidMappingStore.findLidsForPhone).not.toHaveBeenCalled();
@@ -632,12 +706,8 @@ describe('MessageService', () => {
           if (params?.chatIds) chatIds = params.chatIds;
           return qb;
         }),
-        getManyAndCount: jest.fn().mockImplementation(() => {
-          const matched = chatIds && chatIds.includes(stored.chatId) ? [stored] : [];
-          return Promise.resolve([matched, matched.length]);
-        }),
       };
-      return qb;
+      return withListRead(qb, repository, () => (chatIds && chatIds.includes(stored.chatId) ? [stored] : []));
     };
 
     it('returns a @s.whatsapp.net-stored message when filtering by the neutral @c.us chat id', async () => {
@@ -648,26 +718,6 @@ describe('MessageService', () => {
       const { messages } = await service.getMessages('sess-1', { chatId: '6281316434311@c.us' });
 
       expect(messages.map(m => m.id)).toEqual(['m1']);
-    });
-  });
-
-  // ── saveIncomingMessage ───────────────────────────────────────────
-
-  describe('saveIncomingMessage', () => {
-    it('should save with INCOMING direction', async () => {
-      await service.saveIncomingMessage('sess-1', {
-        waMessageId: 'wa-in-1',
-        chatId: 'sender@c.us',
-        body: 'Hi there',
-        type: 'text',
-      });
-
-      expect(repository.create).toHaveBeenCalledWith(
-        expect.objectContaining({
-          sessionId: 'sess-1',
-          direction: MessageDirection.INCOMING,
-        }),
-      );
     });
   });
 
@@ -682,6 +732,13 @@ describe('MessageService', () => {
       });
 
       expect(mockEngine.reactToMessage).toHaveBeenCalledWith('test@c.us', 'wa-msg-1', '👍');
+    });
+  });
+
+  describe('getMessageReceipts', () => {
+    it('should call engine.getMessageReceipts', async () => {
+      await service.getMessageReceipts('sess-1', 'test@c.us', 'wa-msg-1');
+      expect(mockEngine.getMessageReceipts).toHaveBeenCalledWith('test@c.us', 'wa-msg-1');
     });
   });
 
@@ -746,6 +803,246 @@ describe('MessageService', () => {
         expect(mockEngine.getChatHistory).toHaveBeenLastCalledWith('test@c.us', 100, false);
       });
     });
+
+    describe('a deleted message under the id of its stored row', () => {
+      const LID = '148000111@lid';
+      const PHONE = '628999111@c.us';
+      const entry = (id: string, type = 'revoked', author?: string) => ({
+        id,
+        type,
+        body: '',
+        from: 'a',
+        to: 'b',
+        chatId: LID,
+        ...(author ? { author } : {}),
+      });
+      const storedUnder = (...ids: string[]) =>
+        (repository.find as jest.Mock).mockImplementation(
+          ({ where }: { where: { waMessageId: { value: string[] } } }) =>
+            Promise.resolve(
+              ids.filter(id => where.waMessageId.value.includes(id)).map(waMessageId => ({ waMessageId })),
+            ),
+        );
+      const asked = (): string[] =>
+        (repository.find as jest.Mock).mock.calls.flatMap(
+          ([{ where }]: [{ where: { waMessageId: { value: string[] } } }]) => where.waMessageId.value,
+        );
+      const idsOf = async (chatId: string, page: ReturnType<typeof entry>[]) => {
+        mockEngine.getChatHistory.mockResolvedValueOnce(page);
+        return (await service.getChatHistory('sess-1', chatId)).map(m => m.id);
+      };
+
+      it('reports the lid form of a row when the delete notice named the chat by phone number', async () => {
+        storedUnder(`false_${LID}_AAA`);
+        // No lid mapping: the chat asked for supplies the other form.
+        expect(await idsOf(LID, [entry(`false_${PHONE}_AAA`)])).toEqual([`false_${LID}_AAA`]);
+        // A person's chat names no author, so the mapping is not read for one.
+        expect(lidMappingStore.lidsForPhonesPersisted).not.toHaveBeenCalled();
+        expect(lidMappingStore.phonesForLidsPersisted).not.toHaveBeenCalled();
+      });
+
+      it('takes the other form from the ids of the page when the chat asked for does not supply it', async () => {
+        storedUnder(`false_${LID}_AAA`);
+        const ids = await idsOf(PHONE, [entry(`false_${LID}_ZZZ`, 'text'), entry(`false_${PHONE}_AAA`)]);
+        expect(ids).toEqual([`false_${LID}_ZZZ`, `false_${LID}_AAA`]);
+      });
+
+      it('takes the other form from the id the engine holds the chat under when the page has no entry in it', async () => {
+        storedUnder(`false_${LID}_AAA`);
+        // Asked for by phone number, no lid mapping, and every entry of the page named as its delete notice did.
+        const page = [entry(`false_${PHONE}_AAA`)];
+        expect(
+          await idsOf(
+            PHONE,
+            page.map(m => ({ ...m })),
+          ),
+        ).toEqual([`false_${PHONE}_AAA`]);
+        rememberChatOfPage(page, LID);
+        expect(await idsOf(PHONE, page)).toEqual([`false_${LID}_AAA`]);
+      });
+
+      it('keeps the id the engine reports when a row is stored under it, whatever else is stored', async () => {
+        // A row stored while the chat was known by phone number, and a message stored under both forms.
+        storedUnder(`false_${PHONE}_AAA`, `true_${PHONE}_BBB`, `true_${LID}_BBB`);
+        const ids = await idsOf(LID, [entry(`false_${PHONE}_AAA`), entry(`true_${PHONE}_BBB`)]);
+        expect(ids).toEqual([`false_${PHONE}_AAA`, `true_${PHONE}_BBB`]);
+      });
+
+      it('reports the form the lid mapping knows when neither the page nor the chat asked for has it', async () => {
+        lidMappingStore.findPhoneForLid.mockResolvedValue('628999111');
+        storedUnder(`false_${PHONE}_AAA`);
+
+        const ids = await idsOf(LID, [
+          entry(`false_${LID}_AAA`),
+          entry(`false_${LID}_CCC`),
+          entry(`false_${LID}_DDD`, 'text'),
+        ]);
+
+        // AAA is stored in the other form only, CCC nowhere; DDD is not deleted and is not looked up.
+        expect(ids).toEqual([`false_${PHONE}_AAA`, `false_${LID}_CCC`, `false_${LID}_DDD`]);
+        expect(repository.find).toHaveBeenCalledTimes(1);
+        const [{ select, where }] = (repository.find as jest.Mock).mock.calls[0] as [
+          { select: unknown; where: { sessionId: string } },
+        ];
+        expect(select).toEqual({ waMessageId: true });
+        expect(where.sessionId).toBe('sess-1');
+        expect(asked().sort()).toEqual(
+          [
+            `false_${LID}_AAA`,
+            `false_${PHONE}_AAA`,
+            'false_628999111@s.whatsapp.net_AAA',
+            `false_${LID}_CCC`,
+            `false_${PHONE}_CCC`,
+            'false_628999111@s.whatsapp.net_CCC',
+          ].sort(),
+        );
+      });
+
+      it('asks for a deep page in several statements and still finds a row named in a later one', async () => {
+        storedUnder(`false_${LID}_M599`);
+        const page = Array.from({ length: 600 }, (_, i) => entry(`false_${PHONE}_M${i}`));
+        mockEngine.getChatHistory.mockResolvedValueOnce(page);
+
+        const ids = (await service.getChatHistory('sess-1', LID, 2000, false, true)).map(m => m.id);
+
+        expect(ids[599]).toBe(`false_${LID}_M599`);
+        expect(ids[0]).toBe(`false_${PHONE}_M0`);
+        const sizes = (repository.find as jest.Mock).mock.calls.map(
+          ([{ where }]: [{ where: { waMessageId: { value: string[] } } }]) => where.waMessageId.value.length,
+        );
+        expect(sizes).toEqual([500, 500, 200]);
+        expect(new Set(asked()).size).toBe(1200);
+      });
+
+      describe('in a group, where the author can be named in the other form', () => {
+        const GROUP = '120363000111@g.us';
+        const BY_PHONE = `false_${GROUP}_AAA_628999111@c.us`;
+        const BY_LID = `false_${GROUP}_AAA_148000111@lid`;
+
+        it('takes the author form from the lid mapping, in one read for the phone numbers and one for the lids', async () => {
+          lidMappingStore.lidsForPhonesPersisted.mockResolvedValue({ '628999111': ['148000111'] });
+          lidMappingStore.phonesForLidsPersisted.mockResolvedValue({ '148000222': '628999222' });
+          storedUnder(BY_LID, `false_${GROUP}_CCC_628999222@c.us`);
+
+          const ids = await idsOf(GROUP, [
+            entry(BY_PHONE),
+            entry(`false_${GROUP}_BBB_628999111@c.us`),
+            entry(`false_${GROUP}_CCC_148000222@lid`),
+            entry(`false_${GROUP}_DDD_628999333@c.us`, 'text'),
+          ]);
+
+          expect(ids).toEqual([
+            BY_LID,
+            `false_${GROUP}_BBB_628999111@c.us`,
+            `false_${GROUP}_CCC_628999222@c.us`,
+            `false_${GROUP}_DDD_628999333@c.us`,
+          ]);
+          // Only the authors of deleted entries are asked for, each once, in a batch per form.
+          expect(lidMappingStore.lidsForPhonesPersisted).toHaveBeenCalledTimes(1);
+          expect(lidMappingStore.lidsForPhonesPersisted).toHaveBeenCalledWith(['628999111']);
+          expect(lidMappingStore.phonesForLidsPersisted).toHaveBeenCalledTimes(1);
+          expect(lidMappingStore.phonesForLidsPersisted).toHaveBeenCalledWith(['148000222']);
+        });
+
+        // The entry of a deleted message carries the fields of its delete notice: `author` is whoever
+        // deleted it, and in a group that can be an admin. Their own message with the same stanza is
+        // another message.
+        it('does not take the author of the delete notice for the author of the message', async () => {
+          storedUnder(`false_${GROUP}_AAA_148000999@lid`);
+          const ids = await idsOf(GROUP, [entry(BY_PHONE, 'revoked', '148000999@lid')]);
+          expect(ids).toEqual([BY_PHONE]);
+        });
+
+        it("takes the account's own id for a message it sent and deleted", async () => {
+          storedUnder(`true_${GROUP}_AAA_628999111@c.us`);
+          const own = { ...entry(`true_${GROUP}_AAA_148000111@lid`), fromMe: true, from: '628999111@c.us' };
+          expect(await idsOf(GROUP, [own])).toEqual([`true_${GROUP}_AAA_628999111@c.us`]);
+        });
+
+        it("does not take the account's id for a message somebody else sent or deleted", async () => {
+          // The account, an admin, deleted a member's message: the notice is its own, the message is not.
+          storedUnder(`false_${GROUP}_AAA_628999111@c.us`);
+          const deletedByAccount = {
+            ...entry(`false_${GROUP}_AAA_148000111@lid`),
+            fromMe: true,
+            from: '628999111@c.us',
+          };
+          expect(await idsOf(GROUP, [deletedByAccount])).toEqual([`false_${GROUP}_AAA_148000111@lid`]);
+          // Somebody else deleted the account's message: `from` is not the account.
+          storedUnder(`true_${GROUP}_AAA_628999222@c.us`);
+          const deletedByOther = {
+            ...entry(`true_${GROUP}_AAA_148000111@lid`),
+            fromMe: false,
+            from: '628999222@c.us',
+          };
+          expect(await idsOf(GROUP, [deletedByOther])).toEqual([`true_${GROUP}_AAA_148000111@lid`]);
+        });
+
+        it('gives every spelling of one author the forms the lid mapping knows', async () => {
+          lidMappingStore.lidsForPhonesPersisted.mockResolvedValue({ '628999111': ['148000111'] });
+          storedUnder(`false_${GROUP}_AAA_148000111@lid`, `false_${GROUP}_BBB_148000111@lid`);
+
+          const ids = await idsOf(GROUP, [
+            entry(`false_${GROUP}_AAA_628999111:2@c.us`),
+            entry(`false_${GROUP}_BBB_628999111@c.us`),
+          ]);
+
+          expect(ids).toEqual([`false_${GROUP}_AAA_148000111@lid`, `false_${GROUP}_BBB_148000111@lid`]);
+          expect(lidMappingStore.lidsForPhonesPersisted).toHaveBeenCalledWith(['628999111']);
+        });
+
+        it('keeps the id the engine reports when a row is stored under it, or when no row has another form', async () => {
+          lidMappingStore.lidsForPhonesPersisted.mockResolvedValue({ '628999111': ['148000111'] });
+          storedUnder(BY_PHONE, BY_LID);
+          expect(await idsOf(GROUP, [entry(BY_PHONE)])).toEqual([BY_PHONE]);
+          storedUnder();
+          expect(await idsOf(GROUP, [entry(BY_PHONE)])).toEqual([BY_PHONE]);
+        });
+
+        it('never takes another message of the group for it: the stanza and the direction stay', async () => {
+          lidMappingStore.lidsForPhonesPersisted.mockResolvedValue({ '628999111': ['148000111'] });
+          storedUnder(`false_${GROUP}_OTHER_148000111@lid`, `true_${GROUP}_AAA_148000111@lid`);
+          expect(await idsOf(GROUP, [entry(BY_PHONE)])).toEqual([BY_PHONE]);
+        });
+
+        it('asks the store for one more id per deleted entry, however many authors the page holds', async () => {
+          lidMappingStore.lidsForPhonesPersisted.mockImplementation((phones: string[]) =>
+            Promise.resolve(Object.fromEntries(phones.map(phone => [phone, [`148${phone.slice(3)}`]]))),
+          );
+          storedUnder();
+          const page = Array.from({ length: 300 }, (_, i) =>
+            entry(`false_${GROUP}_M${i}_628100${String(i).padStart(3, '0')}@c.us`, i < 40 ? 'revoked' : 'text'),
+          );
+          mockEngine.getChatHistory.mockResolvedValueOnce(page);
+
+          await service.getChatHistory('sess-1', GROUP, 2000, false, true);
+
+          expect(asked()).toHaveLength(80);
+          expect(lidMappingStore.lidsForPhonesPersisted).toHaveBeenCalledTimes(1);
+        });
+      });
+
+      it('looks nothing up for a page with no deleted message', async () => {
+        lidMappingStore.findPhoneForLid.mockResolvedValue('628999111');
+        expect(await idsOf(LID, [entry(`false_${PHONE}_AAA`, 'text')])).toEqual([`false_${PHONE}_AAA`]);
+        expect(lidMappingStore.findPhoneForLid).not.toHaveBeenCalled();
+        expect(repository.find).not.toHaveBeenCalled();
+      });
+
+      it('does not ask the store about a deleted message whose id has one form', async () => {
+        // A group id, an id that is not a full one, and a person chat known by a single form.
+        expect(
+          await idsOf('120363000111@g.us', [entry('false_120363000111@g.us_AAA_148000111@lid'), entry('3EB0CCC')]),
+        ).toEqual(['false_120363000111@g.us_AAA_148000111@lid', '3EB0CCC']);
+        expect(await idsOf(LID, [entry(`false_${LID}_AAA`)])).toEqual([`false_${LID}_AAA`]);
+        expect(repository.find).not.toHaveBeenCalled();
+      });
+
+      it('returns the page as the engine gave it when the store cannot be read', async () => {
+        (repository.find as jest.Mock).mockRejectedValue(new Error('database is locked'));
+        expect(await idsOf(LID, [entry(`false_${PHONE}_AAA`)])).toEqual([`false_${PHONE}_AAA`]);
+      });
+    });
   });
 
   describe('deleteMessage', () => {
@@ -767,6 +1064,46 @@ describe('MessageService', () => {
 
       expect(mockEngine.deleteMessage).toHaveBeenCalledWith('test@c.us', 'wa-msg-1', false);
     });
+
+    it('clears the stored row through the same revoke as an engine revoke, after the engine delete', async () => {
+      await service.deleteMessage('sess-1', { chatId: 'test@c.us', messageId: 'wa-msg-1' });
+
+      // Naming the chat it deleted in, so the row of another chat that holds the id is left alone.
+      expect(messageProjector.recordRevoke).toHaveBeenCalledWith('sess-1', 'wa-msg-1', {
+        kind: 'revoke',
+        chatId: 'test@c.us',
+      });
+      expect(mockEngine.deleteMessage.mock.invocationCallOrder[0]).toBeLessThan(
+        messageProjector.recordRevoke.mock.invocationCallOrder[0],
+      );
+      expect(repository.update).not.toHaveBeenCalled();
+    });
+
+    it('also clears the row stored under the id the engine deleted, after the id the caller named', async () => {
+      mockEngine.deleteMessage.mockResolvedValueOnce('true_test@c.us_wa-msg-1');
+
+      await service.deleteMessage('sess-1', { chatId: 'test@c.us', messageId: 'wa-msg-1' });
+
+      const source = { kind: 'revoke', chatId: 'test@c.us' };
+      expect(messageProjector.recordRevoke.mock.calls).toEqual([
+        ['sess-1', 'wa-msg-1', source],
+        ['sess-1', 'true_test@c.us_wa-msg-1', source],
+      ]);
+    });
+
+    it.each([
+      ['the id the caller named', 'wa-msg-1'],
+      ['an empty id', ''],
+      ['no id', undefined],
+      ['something that is not an id', {}],
+    ])('clears one row when the engine answers %s', async (_what, answer) => {
+      mockEngine.deleteMessage.mockResolvedValueOnce(answer);
+
+      await service.deleteMessage('sess-1', { chatId: 'test@c.us', messageId: 'wa-msg-1' });
+
+      expect(messageProjector.recordRevoke).toHaveBeenCalledTimes(1);
+      expect(messageProjector.recordRevoke).toHaveBeenCalledWith('sess-1', 'wa-msg-1', expect.anything());
+    });
   });
 
   describe('editMessage', () => {
@@ -776,7 +1113,11 @@ describe('MessageService', () => {
       expect(mockEngine.editMessage).toHaveBeenCalledWith('test@c.us', 'wa-msg-1', 'edited');
       // Persistence is delegated to the session's per-message mutation queue (serialized with the
       // inbound edit path) — the service no longer writes the row directly.
-      expect(messageProjector.recordOutboundMessageEdit).toHaveBeenCalledWith('sess-1', 'wa-msg-1', 'edited');
+      expect(messageProjector.recordOutboundMessageEdit).toHaveBeenCalledWith('sess-1', 'wa-msg-1', 'edited', {
+        kind: 'edit',
+        chatId: 'test@c.us',
+        fromMe: true,
+      });
       expect(repository.update).not.toHaveBeenCalled();
       expect(res).toEqual({ messageId: 'wa-msg-1', timestamp: 1706868000 });
     });
@@ -817,6 +1158,14 @@ describe('MessageService', () => {
       );
     });
 
+    // An edit only UPDATEs the existing row, so it is judged against the caps but never held in the
+    // admission window: holding it would charge the day's allowance for a message that is not sent.
+    it('checks an edit against the pacing caps without holding it', async () => {
+      await service.editMessage('sess-1', { chatId: 'test@c.us', messageId: 'wa-msg-1', body: 'edited' });
+
+      expect(pacing.assertSendAllowed).toHaveBeenCalledWith('sess-1', 'test@c.us', { hold: false });
+    });
+
     it('lets a plugin block an edit before the engine is called', async () => {
       (hookManager.execute as jest.Mock).mockResolvedValueOnce({ continue: false, data: {} });
 
@@ -837,7 +1186,28 @@ describe('MessageService', () => {
       await service.editMessage('sess-1', { chatId: 'test@c.us', messageId: 'wa-msg-1', body: 'secret' });
 
       expect(mockEngine.editMessage).toHaveBeenCalledWith('test@c.us', 'wa-msg-1', 'redacted');
-      expect(messageProjector.recordOutboundMessageEdit).toHaveBeenCalledWith('sess-1', 'wa-msg-1', 'redacted');
+      expect(messageProjector.recordOutboundMessageEdit).toHaveBeenCalledWith(
+        'sess-1',
+        'wa-msg-1',
+        'redacted',
+        expect.objectContaining({ kind: 'edit', chatId: 'test@c.us' }),
+      );
+    });
+
+    it('judges the stored row by the chat the gate sent the edit to, not the one the caller named', async () => {
+      (hookManager.execute as jest.Mock).mockResolvedValueOnce({
+        continue: true,
+        data: { input: { chatId: 'other@c.us', messageId: 'wa-msg-1', body: 'edited' } },
+      });
+
+      await service.editMessage('sess-1', { chatId: 'test@c.us', messageId: 'wa-msg-1', body: 'edited' });
+
+      expect(mockEngine.editMessage).toHaveBeenCalledWith('other@c.us', 'wa-msg-1', 'edited');
+      expect(messageProjector.recordOutboundMessageEdit).toHaveBeenCalledWith('sess-1', 'wa-msg-1', 'edited', {
+        kind: 'edit',
+        chatId: 'other@c.us',
+        fromMe: true,
+      });
     });
 
     it('honours a plugin that rewrites the tag list, not the list the caller sent', async () => {
@@ -910,7 +1280,14 @@ describe('MessageService', () => {
     const archived = (mimetype: string) => ({
       getMedia: jest.fn().mockResolvedValue({ path: 'chat-media/sess-1/abc.bin', mimetype }),
     });
-    const storage = (buffer = Buffer.from('BYTES')) => ({ getFile: jest.fn().mockResolvedValue(buffer) });
+    const storage = (buffer = Buffer.from('BYTES')) => ({
+      openFile: jest.fn().mockResolvedValue({ stream: Readable.from([buffer]), size: buffer.length }),
+    });
+    /** The served bytes and type, read from the stream the route pipes out. */
+    const served = async (media: Promise<{ stream: Readable; mimetype: string }>) => {
+      const { stream, mimetype } = await media;
+      return { buffer: Buffer.concat(await stream.toArray()), mimetype };
+    };
 
     const build = (archive: unknown, store: unknown): MessageService =>
       new MessageService(
@@ -927,7 +1304,7 @@ describe('MessageService', () => {
 
     it('serves an inert image type unchanged', async () => {
       const svc = build(archived('image/jpeg'), storage());
-      await expect(svc.getChatMedia('sess-1', 'c@c.us', 'wa-1')).resolves.toEqual({
+      expect(await served(svc.getChatMedia('sess-1', 'c@c.us', 'wa-1'))).toEqual({
         buffer: Buffer.from('BYTES'),
         mimetype: 'image/jpeg',
       });
@@ -944,6 +1321,21 @@ describe('MessageService', () => {
       expect(served).toBe('application/octet-stream');
     });
 
+    // A sender declares the mimetype, and the value becomes the Content-Type header. Parameters are
+    // dropped: a comma inside them makes a browser read a second type, and a character above U+00FF
+    // makes Node refuse the header, which failed the route with a 500 on every call.
+    it.each([
+      ['image/png;x=1,text/html', 'image/png'],
+      ['image/png;,image/svg+xml', 'image/png'],
+      ['image/jpeg;\u0101', 'image/jpeg'],
+      ['audio/ogg; codecs=opus', 'audio/ogg'],
+      ['IMAGE/PNG', 'image/png'],
+    ])('serves %p as its essence %p', async (declared, expected) => {
+      const svc = build(archived(declared), storage());
+      const { mimetype: served } = await svc.getChatMedia('sess-1', 'c@c.us', 'wa-1');
+      expect(served).toBe(expected);
+    });
+
     it('404s when nothing is archived for the message', async () => {
       const svc = build({ getMedia: jest.fn().mockResolvedValue(null) }, storage());
       await expect(svc.getChatMedia('sess-1', 'c@c.us', 'wa-1')).rejects.toThrow(NotFoundException);
@@ -957,12 +1349,12 @@ describe('MessageService', () => {
       ['S3 NotFound', Object.assign(new Error('NotFound'), { name: 'NotFound' })],
       ['S3 404 metadata', Object.assign(new Error('gone'), { $metadata: { httpStatusCode: 404 } })],
     ])('404s when the row outlived its file (%s)', async (_label, err) => {
-      const svc = build(archived('image/png'), { getFile: jest.fn().mockRejectedValue(err) });
+      const svc = build(archived('image/png'), { openFile: jest.fn().mockRejectedValue(err) });
       await expect(svc.getChatMedia('sess-1', 'c@c.us', 'wa-1')).rejects.toThrow(NotFoundException);
     });
 
     it('does not swallow a genuine storage fault as a 404', async () => {
-      const svc = build(archived('image/png'), { getFile: jest.fn().mockRejectedValue(new Error('S3 500')) });
+      const svc = build(archived('image/png'), { openFile: jest.fn().mockRejectedValue(new Error('S3 500')) });
       await expect(svc.getChatMedia('sess-1', 'c@c.us', 'wa-1')).rejects.toThrow('S3 500');
     });
 
@@ -976,7 +1368,7 @@ describe('MessageService', () => {
         inlineRow({ mimetype: 'image/jpeg', data: Buffer.from('INLINE').toString('base64') }),
       );
       const svc = build(noArchive(), storage());
-      await expect(svc.getChatMedia('sess-1', 'c@c.us', 'wa-1')).resolves.toEqual({
+      expect(await served(svc.getChatMedia('sess-1', 'c@c.us', 'wa-1'))).toEqual({
         buffer: Buffer.from('INLINE'),
         mimetype: 'image/jpeg',
       });
@@ -990,7 +1382,7 @@ describe('MessageService', () => {
         inlineRow({ mimetype: 'image/jpeg', data: Buffer.from('SENT').toString('base64') }),
       );
       const svc = build(noArchive(), storage());
-      await expect(svc.getChatMedia('sess-1', '628123456789@s.whatsapp.net', 'wa-1')).resolves.toEqual({
+      expect(await served(svc.getChatMedia('sess-1', '628123456789@s.whatsapp.net', 'wa-1'))).toEqual({
         buffer: Buffer.from('SENT'),
         mimetype: 'image/jpeg',
       });
@@ -1003,12 +1395,21 @@ describe('MessageService', () => {
       });
     });
 
+    it('404s for a revoked row that still carries an inline copy', async () => {
+      (repository.findOne as jest.Mock).mockResolvedValue({
+        ...inlineRow({ mimetype: 'image/jpeg', data: Buffer.from('GONE').toString('base64') }),
+        type: 'revoked',
+      });
+      const svc = build(noArchive(), storage());
+      await expect(svc.getChatMedia('sess-1', 'c@c.us', 'wa-1')).rejects.toThrow(NotFoundException);
+    });
+
     it('prefers the archived file over the inline copy when both exist', async () => {
       (repository.findOne as jest.Mock).mockResolvedValue(
         inlineRow({ mimetype: 'image/png', data: Buffer.from('INLINE').toString('base64') }),
       );
       const svc = build(archived('image/png'), storage(Buffer.from('ARCHIVE-BYTES')));
-      await expect(svc.getChatMedia('sess-1', 'c@c.us', 'wa-1')).resolves.toEqual({
+      expect(await served(svc.getChatMedia('sess-1', 'c@c.us', 'wa-1'))).toEqual({
         buffer: Buffer.from('ARCHIVE-BYTES'),
         mimetype: 'image/png',
       });
@@ -1041,9 +1442,9 @@ describe('MessageService', () => {
         inlineRow({ mimetype: 'image/jpeg', data: Buffer.from('STILL-HERE').toString('base64') }),
       );
       const svc = build(archived('image/jpeg'), {
-        getFile: jest.fn().mockRejectedValue(Object.assign(new Error('missing'), { code: 'ENOENT' })),
+        openFile: jest.fn().mockRejectedValue(Object.assign(new Error('missing'), { code: 'ENOENT' })),
       });
-      await expect(svc.getChatMedia('sess-1', 'c@c.us', 'wa-1')).resolves.toEqual({
+      expect(await served(svc.getChatMedia('sess-1', 'c@c.us', 'wa-1'))).toEqual({
         buffer: Buffer.from('STILL-HERE'),
         mimetype: 'image/jpeg',
       });
@@ -1054,7 +1455,7 @@ describe('MessageService', () => {
         inlineRow({ mimetype: 'image/jpeg', data: Buffer.from('INLINE').toString('base64') }),
       );
       const svc = build(archived('image/jpeg'), undefined);
-      await expect(svc.getChatMedia('sess-1', 'c@c.us', 'wa-1')).resolves.toEqual({
+      expect(await served(svc.getChatMedia('sess-1', 'c@c.us', 'wa-1'))).toEqual({
         buffer: Buffer.from('INLINE'),
         mimetype: 'image/jpeg',
       });
@@ -1084,9 +1485,10 @@ describe('MessageService', () => {
           addOrderBy: jest.fn().mockReturnThis(),
           skip: jest.fn().mockReturnThis(),
           take: jest.fn().mockReturnThis(),
-          getManyAndCount: jest.fn().mockResolvedValue([rows, 100]),
         };
-        (repository.createQueryBuilder as unknown as jest.Mock).mockReturnValue(builder);
+        (repository.createQueryBuilder as unknown as jest.Mock).mockReturnValue(
+          withListRead(builder, repository, () => rows),
+        );
 
         const result = await service.getMessages('sess-1', { limit: 100 });
 
@@ -1120,9 +1522,10 @@ describe('MessageService', () => {
         addOrderBy: jest.fn().mockReturnThis(),
         skip: jest.fn().mockReturnThis(),
         take: jest.fn().mockReturnThis(),
-        getManyAndCount: jest.fn().mockResolvedValue([rows, 3]),
       };
-      (repository.createQueryBuilder as unknown as jest.Mock).mockReturnValue(builder);
+      (repository.createQueryBuilder as unknown as jest.Mock).mockReturnValue(
+        withListRead(builder, repository, () => rows),
+      );
 
       const result = await service.getMessages('sess-1', { limit: 100, inlineMedia: false });
 
@@ -1225,5 +1628,18 @@ describe('spendInlineMediaBudget', () => {
 
     expect(mediaOf(rows[0]).data).toBeUndefined();
     expect(mediaOf(rows[0]).omitted).toBe(true);
+  });
+  // A revoked message has no media. A row restored from an older backup, or merged onto after its
+  // revoke was cleared, can still carry a payload; the list must not return it, and it must not
+  // spend the newest-payload allowance the next real media is owed.
+  it('drops the media of a revoked row and still inlines the media after it', () => {
+    const revoked = row('revoked', 5000);
+    revoked.type = 'revoked';
+    const rows = [revoked, row('image', 3000)];
+    spendInlineMediaBudget(rows, 1000);
+
+    expect(rows[0].metadata.media).toBeUndefined();
+    expect(mediaOf(rows[1]).data).toHaveLength(3000);
+    expect(mediaOf(rows[1]).omitted).toBeUndefined();
   });
 });

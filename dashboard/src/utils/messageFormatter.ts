@@ -66,10 +66,15 @@ export function parseMessageBody(input: string): MessageNode[] {
     cursor = end;
   };
 
+  // The next triple backtick is searched for again only once the cursor has passed it: looking from
+  // the cursor on every turn scans the whole remainder each time when none follows.
+  let tripleStart = input.indexOf('```');
   while (cursor < input.length) {
     // Look for next ``` first (longer marker wins).
-    const tripleStart = input.indexOf('```', cursor);
-    const singleStart = findSingleBacktick(input, cursor);
+    if (tripleStart !== -1 && tripleStart < cursor) tripleStart = input.indexOf('```', cursor);
+    // A single backtick only wins when it comes before the triple, so the search stops there: running
+    // on to the end of the body at every turn is quadratic in a message made of code blocks.
+    const singleStart = findSingleBacktick(input, cursor, tripleStart === -1 ? input.length : tripleStart);
 
     let nextCode: 'triple' | 'single' | null = null;
     let nextIdx = Infinity;
@@ -117,14 +122,14 @@ export function parseMessageBody(input: string): MessageNode[] {
 }
 
 /**
- * Find next single-backtick that is NOT part of a triple-backtick.
+ * Find next single-backtick, before `limit`, that is NOT part of a triple-backtick.
  * Returns -1 if none.
  */
-function findSingleBacktick(s: string, from: number): number {
+function findSingleBacktick(s: string, from: number, limit: number): number {
   let i = from;
-  while (i < s.length) {
+  while (i < limit) {
     const idx = s.indexOf('`', i);
-    if (idx === -1) return -1;
+    if (idx === -1 || idx >= limit) return -1;
     // Skip if part of a triple-backtick sequence.
     if (s.slice(idx, idx + 3) === '```') {
       i = idx + 3;
@@ -185,9 +190,12 @@ function parseFormatting(input: string, depth = 0): MessageNode[] {
   if (depth >= MAX_FORMAT_DEPTH) return pushText([], input);
 
   const nodes: MessageNode[] = [];
+  // Shared across the loop because every `rest` is a suffix of `input`, so a marker that found no
+  // closer stays without one; not shared with the recursive call, whose `inner` ends earlier.
+  const exhausted = new Set<string>();
   let rest = input;
   while (rest.length > 0) {
-    const split = splitFirstFormat(rest);
+    const split = splitFirstFormat(rest, exhausted);
     if (!split) {
       pushText(nodes, rest);
       break;
@@ -205,9 +213,15 @@ function parseFormatting(input: string, depth = 0): MessageNode[] {
  * marker satisfying the same boundary rules. Returns the text before the span, the format, the
  * inner content, and the unconsumed remainder — or null when the segment holds no valid span
  * (unbalanced or boundary-violating markers stay literal).
+ *
+ * `exhausted` holds the markers an earlier opener already scanned to the end without a closer. A
+ * closer's validity depends only on its neighbours, so a later opener of the same marker would see
+ * a subset of those candidates and cannot succeed either; skipping it keeps the parse linear instead
+ * of rescanning the rest of the message for every unmatched opener.
  */
 function splitFirstFormat(
   input: string,
+  exhausted: Set<string>,
 ): { before: string; fmt: 'bold' | 'italic' | 'strike'; inner: string; after: string } | null {
   for (let i = 0; i < input.length; i++) {
     const skip = mentionEnd(input, i);
@@ -217,7 +231,7 @@ function splitFirstFormat(
     }
     const ch = input[i];
     const fmt = FORMATS[ch];
-    if (!fmt) continue;
+    if (!fmt || exhausted.has(ch)) continue;
 
     // Boundary outside the opener: previous char must be a boundary or string-start.
     const prev = i === 0 ? '' : input[i - 1];
@@ -249,7 +263,8 @@ function splitFirstFormat(
         after: input.slice(j + 1),
       };
     }
-    // No matching closer for this opener — fall through to next character.
+    // No matching closer for this opener, so none for any later one of the same marker either.
+    exhausted.add(ch);
   }
 
   return null;

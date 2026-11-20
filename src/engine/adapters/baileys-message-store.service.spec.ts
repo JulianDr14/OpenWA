@@ -1,5 +1,5 @@
 import type { WAMessage } from '@whiskeysockets/baileys';
-import { DataSource, Repository } from 'typeorm';
+import { DataSource, DeleteQueryBuilder, Repository } from 'typeorm';
 import { BaileysStoredMessage } from './baileys-stored-message.entity';
 import { BaileysMessageStoreService } from './baileys-message-store.service';
 import { Session, SessionStatus } from '../../modules/session/entities/session.entity';
@@ -180,6 +180,35 @@ describe('BaileysMessageStoreService', () => {
     expect(await repo.count({ where: { sessionId: 's2' } })).toBe(2);
     // T4 is the newest (distinct createdAt = now) and must survive.
     expect(await s.getMessage('s2', 'T4')).not.toBeNull();
+  });
+
+  it('evicts same-createdAt rows by id at the cap and bounds the trim delete by the index', async () => {
+    process.env.BAILEYS_MESSAGE_STORE_LIMIT = '3';
+    await seedSession('s3');
+    const s = new BaileysMessageStoreService(repo);
+    const sharedTs = new Date('2024-01-01T00:00:00.000Z');
+    for (const id of ['a', 'b', 'c', 'd']) {
+      await repo.save(
+        repo.create({ id, sessionId: 's3', waMessageId: `W${id}`, serializedMessage: '{}', createdAt: sharedTs }),
+      );
+    }
+    // Pass-through spy: records the SQL every delete builder runs.
+    const spy = jest.spyOn(DeleteQueryBuilder.prototype, 'getQueryAndParameters');
+
+    await s.put('s3', msg('NEW'));
+    const deletes = spy.mock.results.map(r => r.value as [string, unknown[]]);
+    spy.mockRestore();
+
+    // The newest row and the two highest ids of the tied run survive.
+    const left = await repo.find({ where: { sessionId: 's3' }, order: { id: 'ASC' } });
+    expect(left.map(r => r.waMessageId).sort()).toEqual(['NEW', 'Wc', 'Wd']);
+    // The range delete must be bounded by (createdAt, id) on the index, not walk the whole session.
+    expect(deletes).toHaveLength(1);
+    const [sql, params] = deletes[0];
+    const detail = (await ds.query<{ detail: string }[]>(`EXPLAIN QUERY PLAN ${sql}`, params))
+      .map(r => r.detail)
+      .join(' | ');
+    expect(detail).toMatch(/IDX_baileys_stored_messages_session_created_id \(sessionId=\? AND \(createdAt,id\)/);
   });
 
   // Issue #319 — an orphaned adapter (its session was deleted/recreated during reconnect
@@ -370,6 +399,89 @@ describe('BaileysMessageStoreService', () => {
       // Queued first, the update found nothing to change; the put that followed it still landed.
       expect(change).not.toHaveBeenCalled();
       expect((await service.getMessage('s1', 'M1'))?.message?.conversation).toBe('M1');
+    });
+  });
+
+  describe('remove', () => {
+    it('deletes the accepted copy of that session only', async () => {
+      await seedSession('s1');
+      await seedSession('s2');
+      await service.put('s1', msg('M1'));
+      await service.put('s1', msg('M2'));
+      await service.put('s2', msg('M1'));
+
+      await service.remove('s1', 'M1', () => true);
+
+      expect(await service.getMessage('s1', 'M1')).toBeNull();
+      expect(await service.getMessage('s1', 'M2')).not.toBeNull();
+      expect(await service.getMessage('s2', 'M1')).not.toBeNull();
+    });
+
+    it('keeps a copy the caller declines, and leaves an id the store does not hold absent', async () => {
+      await seedSession('s1');
+      await service.put('s1', msg('M1'));
+      const accept = jest.fn(() => false);
+
+      await service.remove('s1', 'M1', accept);
+      await service.remove('s1', 'NOPE', accept);
+
+      expect(accept).toHaveBeenCalledTimes(1); // only for the row that exists
+      expect((accept.mock.calls as unknown as Array<[WAMessage]>)[0][0].key.id).toBe('M1');
+      expect((await service.getMessage('s1', 'M1'))?.message?.conversation).toBe('M1');
+    });
+
+    it('judges the copy held when it runs, behind a put of the same id still in flight', async () => {
+      await seedSession('s1');
+      const seen: unknown[] = [];
+      await Promise.all([
+        service.put('s1', msg('M1')),
+        Promise.resolve().then(() =>
+          service.remove('s1', 'M1', stored => {
+            seen.push(stored.message?.conversation);
+            return true;
+          }),
+        ),
+      ]);
+
+      expect(seen).toEqual(['M1']);
+      expect(await service.getMessage('s1', 'M1')).toBeNull();
+    });
+
+    it('a read issued while the delete is in flight sees the copy gone', async () => {
+      await seedSession('s1');
+      await service.put('s1', msg('M1'));
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => (release = resolve));
+      const real = repo.delete.bind(repo);
+      jest.spyOn(repo, 'delete').mockImplementationOnce(async (...args: Parameters<typeof real>) => {
+        await gate;
+        return real(...args);
+      });
+
+      const removal = service.remove('s1', 'M1', () => true);
+      const read = service.getMessage('s1', 'M1');
+      await ticks();
+      release();
+      await removal;
+
+      expect(await read).toBeNull();
+    });
+
+    // An id the caller could not read must not reach the ORM, which drops an undefined condition and
+    // would match an arbitrary row of the session.
+    it.each([
+      ['empty', ''],
+      ['missing', undefined as unknown as string],
+    ])('does nothing for a %s id', async (_name, id) => {
+      await seedSession('s1');
+      await service.put('s1', msg('M1'));
+      await service.put('s1', msg('M2'));
+      const accept = jest.fn(() => true);
+
+      await service.remove('s1', id, accept);
+
+      expect(accept).not.toHaveBeenCalled();
+      expect(await repo.count({ where: { sessionId: 's1' } })).toBe(2);
     });
   });
 

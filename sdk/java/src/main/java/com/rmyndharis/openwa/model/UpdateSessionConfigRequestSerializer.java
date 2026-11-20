@@ -11,9 +11,10 @@ import java.lang.reflect.Type;
  * null, a non-null box becomes its value, and a field that is neither is left out so the server
  * leaves it unchanged.
  *
- * <p>Registered on the client's single Gson for this type only — a global {@code serializeNulls()}
- * would turn every unset field of every other request body into an explicit null, which for this
- * route means "reset to default" and would be far worse than the gap it fixes.
+ * <p>Registered only on the client's dedicated null-emitting Gson, which uses {@code serializeNulls()}
+ * so the explicit nulls emitted here survive the writer, and which {@code bodySerializer()} selects
+ * for this type. The shared Gson must not use {@code serializeNulls()}: it would turn every unset
+ * field of every other request body into an explicit null.
  */
 public final class UpdateSessionConfigRequestSerializer implements JsonSerializer<UpdateSessionConfigRequest> {
     @Override
@@ -33,6 +34,11 @@ public final class UpdateSessionConfigRequestSerializer implements JsonSerialize
             out.add("reconnectBaseDelay", null);
         } else if (src.reconnectBaseDelay() != null) {
             out.addProperty("reconnectBaseDelay", src.reconnectBaseDelay());
+        }
+        if (src.clearLinkPreview()) {
+            out.add("linkPreview", null);
+        } else if (src.linkPreview() != null) {
+            out.addProperty("linkPreview", src.linkPreview());
         }
         return out;
     }
